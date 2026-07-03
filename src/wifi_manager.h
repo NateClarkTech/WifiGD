@@ -2,7 +2,7 @@
 
 #include "platform/network_backend.h"
 
-#include <godot_cpp/classes/ref_counted.hpp>
+#include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string.hpp>
@@ -12,8 +12,8 @@
 
 namespace godot {
 
-class WifiManager : public RefCounted {
-	GDCLASS(WifiManager, RefCounted)
+class WifiManager : public Node {
+	GDCLASS(WifiManager, Node)
 
 private:
 	std::unique_ptr<wifigd::NetworkBackend> backend;
@@ -28,6 +28,14 @@ private:
 	Error pending_error = OK;
 	String pending_message;
 
+	Dictionary cached_connectivity;
+	Array cached_adapters;
+	int last_connection_state = 0;
+	bool last_wifi_enabled = false;
+	double connectivity_poll_timer = 0.0;
+
+	static constexpr double CONNECTIVITY_POLL_INTERVAL_SEC = 2.0;
+
 	static void _scan_native_task(void *p_userdata);
 	static void _connect_native_task(void *p_userdata);
 	static void _disconnect_native_task(void *p_userdata);
@@ -38,11 +46,17 @@ private:
 	void _emit_disconnect_completed();
 	void _emit_adapters_updated();
 	void _flush_console_logs() const;
+	void _poll_connectivity();
+	void _update_cached_connectivity(const Dictionary &info);
+	void _update_cached_adapters(const Array &adapters);
 
 protected:
 	static void _bind_methods();
 
 public:
+	void _ready() override;
+	void _exit_tree() override;
+	void _process(double delta) override;
 	WifiManager();
 	~WifiManager() override;
 
@@ -59,7 +73,11 @@ public:
 	void disconnect_from_wifi_async(const String &adapter_id = "");
 
 	Dictionary get_connectivity_info() const;
+	Dictionary get_cached_connectivity() const;
+	int get_connection_state() const;
+
 	Array get_network_adapters() const;
+	Array get_cached_adapters() const;
 	void fetch_adapters_async();
 
 	String get_last_error() const;

@@ -16,7 +16,6 @@ extends Control
 @onready var _refresh_adapters_button: Button = %RefreshAdaptersButton
 @onready var _refresh_status_button: Button = %RefreshStatusButton
 
-var _wifi: WifiManager
 var _busy: bool = false
 var _uses_async_api: bool = false
 
@@ -27,19 +26,17 @@ var _selected_network_index: int = -1
 
 
 func _ready() -> void:
-	_wifi = WifiManager.new()
-	_uses_async_api = _wifi.has_signal("scan_completed")
+	_uses_async_api = WiFi.has_signal("scan_completed")
 
 	if _uses_async_api:
-		_wifi.scan_completed.connect(_on_scan_completed)
-		_wifi.connect_completed.connect(_on_connect_completed)
-		_wifi.disconnect_completed.connect(_on_disconnect_completed)
-		_wifi.adapters_updated.connect(_on_adapters_updated)
+		WiFi.scan_completed.connect(_on_scan_completed)
+		WiFi.connect_completed.connect(_on_connect_completed)
+		WiFi.disconnect_completed.connect(_on_disconnect_completed)
+		WiFi.adapters_updated.connect(_on_adapters_updated)
+		WiFi.connectivity_changed.connect(_on_connectivity_changed)
 	else:
-		_log_message("ERROR: Outdated WifiGD DLL loaded in demo/addons/WifiGD/bin.")
-		_log_message("Close Godot, rebuild, then sync:")
-		_log_message("  scons platform=windows")
-		_log_message("  .\\sync_addon.ps1")
+		_log_message("ERROR: Outdated WifiGD library loaded in demo/addons/WifiGD/bin.")
+		_log_message("Close Godot, rebuild with: scons platform=linux")
 		_log_message("Falling back to synchronous API (UI will freeze during scan).")
 
 	_log_message("WifiGD demo ready.")
@@ -59,6 +56,11 @@ func _set_busy(is_busy: bool) -> void:
 	_refresh_adapters_button.disabled = is_busy
 	_refresh_status_button.disabled = is_busy
 	_wifi_radio.disabled = is_busy
+
+
+func _on_connectivity_changed(info: Dictionary) -> void:
+	_update_status_summary(info)
+	_update_connectivity_details(info)
 
 
 func _log_message(message: String) -> void:
@@ -229,18 +231,18 @@ func _refresh_adapters() -> void:
 	_set_busy(true)
 	_log_message("Refreshing adapters...")
 	if _uses_async_api:
-		_wifi.fetch_adapters_async()
+		WiFi.fetch_adapters_async()
 	else:
-		_adapters = _wifi.get_network_adapters()
-		var message := _wifi.get_last_error()
+		_adapters = WiFi.get_network_adapters()
+		var message: String = WiFi.get_last_error()
 		_on_adapters_updated(_adapters, OK if not _adapters.is_empty() or message.is_empty() else ERR_CANT_CONNECT, message)
 
 
 func _refresh_connectivity() -> void:
-	var connectivity: Dictionary = _wifi.get_connectivity_info()
+	var connectivity: Dictionary = WiFi.get_connectivity_info()
 	_update_status_summary(connectivity)
 	_update_connectivity_details(connectivity)
-	_wifi_radio.set_pressed_no_signal(_wifi.is_wifi_enabled())
+	_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
 
 
 func _on_adapter_selected(index: int) -> void:
@@ -279,11 +281,11 @@ func _on_scan_pressed() -> void:
 	_set_busy(true)
 	_log_message("Scanning for Wi-Fi networks...")
 	if _uses_async_api:
-		_wifi.scan_wifi_networks_async(adapter_id)
+		WiFi.scan_wifi_networks_async(adapter_id)
 	else:
 		await get_tree().process_frame
-		var networks: Array = _wifi.scan_wifi_networks(adapter_id)
-		_apply_scan_result(networks, OK if not networks.is_empty() else ERR_CANT_CONNECT, _wifi.get_last_error())
+		var networks: Array = WiFi.scan_wifi_networks(adapter_id)
+		_apply_scan_result(networks, OK if not networks.is_empty() else ERR_CANT_CONNECT, WiFi.get_last_error())
 
 
 func _on_connect_pressed() -> void:
@@ -297,19 +299,19 @@ func _on_connect_pressed() -> void:
 	_set_busy(true)
 	_log_message("Connecting to %s..." % ssid)
 	if _uses_async_api:
-		_wifi.connect_to_wifi_async(
+		WiFi.connect_to_wifi_async(
 			ssid,
 			_password_field.text,
 			_wifi_adapter_id_for_operations()
 		)
 	else:
 		await get_tree().process_frame
-		var err: Error = _wifi.connect_to_wifi(
+		var err: Error = WiFi.connect_to_wifi(
 			ssid,
 			_password_field.text,
 			_wifi_adapter_id_for_operations()
 		)
-		_on_connect_completed(err, _wifi.get_last_error())
+		_on_connect_completed(err, WiFi.get_last_error())
 
 
 func _on_disconnect_pressed() -> void:
@@ -318,11 +320,11 @@ func _on_disconnect_pressed() -> void:
 	_set_busy(true)
 	_log_message("Disconnecting...")
 	if _uses_async_api:
-		_wifi.disconnect_from_wifi_async(_wifi_adapter_id_for_operations())
+		WiFi.disconnect_from_wifi_async(_wifi_adapter_id_for_operations())
 	else:
 		await get_tree().process_frame
-		var err: Error = _wifi.disconnect_from_wifi(_wifi_adapter_id_for_operations())
-		_on_disconnect_completed(err, _wifi.get_last_error())
+		var err: Error = WiFi.disconnect_from_wifi(_wifi_adapter_id_for_operations())
+		_on_disconnect_completed(err, WiFi.get_last_error())
 
 
 func _on_refresh_status_pressed() -> void:
@@ -335,11 +337,11 @@ func _on_wifi_radio_toggled(enabled: bool) -> void:
 	_set_busy(true)
 	_log_message("Setting Wi-Fi radio to %s..." % ("on" if enabled else "off"))
 
-	if not _wifi.set_wifi_enabled(enabled):
-		_log_message("ERROR: Wi-Fi radio change failed: %s" % _wifi.get_last_error())
+	if not WiFi.set_wifi_enabled(enabled):
+		_log_message("ERROR: Wi-Fi radio change failed: %s" % WiFi.get_last_error())
 	else:
-		_log_message("OK: Wi-Fi radio is now %s." % ("enabled" if _wifi.is_wifi_enabled() else "disabled"))
-	_wifi_radio.set_pressed_no_signal(_wifi.is_wifi_enabled())
+		_log_message("OK: Wi-Fi radio is now %s." % ("enabled" if WiFi.is_wifi_enabled() else "disabled"))
+	_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
 	_set_busy(false)
 
 

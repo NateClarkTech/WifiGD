@@ -1,53 +1,702 @@
 #include "network_backend_linux.h"
 
-// Linux implementation uses NetworkManager (nmcli) and sysfs/netlink.
-// Requires NetworkManager and polkit permissions for connect/disconnect.
+#include "../../console_log.h"
+
+#include <godot_cpp/variant/utility_functions.hpp>
+
+#include <NetworkManager.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <vector>
 
 namespace wifigd {
+
+namespace {
+
+constexpr int kScanTimeoutSec = 15;
+constexpr int kConnectTimeoutSec = 30;
+constexpr int kConnectPollIntervalMs = 200;
+constexpr const char *kWifiGdConnectionId = "WifiGD Connection";
+
+godot::String gbytes_to_ssid(GBytes *ssid_bytes) {
+	if (ssid_bytes == nullptr) {
+		return godot::String();
+	}
+	gsize len = 0;
+	const guint8 *data = static_cast<const guint8 *>(g_bytes_get_data(ssid_bytes, &len));
+	if (data == nullptr || len == 0) {
+		return godot::String();
+	}
+	return godot::String::utf8(reinterpret_cast<const char *>(data), (int64_t)len);
+}
+
+godot::String bssid_to_string(const char *bssid) {
+	return bssid != nullptr ? godot::String::utf8(bssid) : godot::String();
+}
+
+void frequency_to_band_and_channel(guint32 frequency_mhz, int &channel, godot::String &band) {
+	channel = 0;
+	band = "";
+
+	if (frequency_mhz == 0) {
+		return;
+	}
+
+	if (frequency_mhz >= 5925) {
+		band = "6";
+	} else if (frequency_mhz >= 4900) {
+		band = "5";
+	} else {
+		band = "2.4";
+	}
+
+	if (frequency_mhz >= 2412 && frequency_mhz <= 2484) {
+		if (frequency_mhz == 2484) {
+			channel = 14;
+		} else {
+			channel = (int)((frequency_mhz - 2412) / 5) + 1;
+		}
+	} else if (frequency_mhz >= 5170 && frequency_mhz <= 5825) {
+		channel = (int)((frequency_mhz - 5000) / 5);
+	} else if (frequency_mhz >= 5955 && frequency_mhz <= 7115) {
+		channel = (int)((frequency_mhz - 5950) / 5);
+	}
+}
+
+godot::String security_type_from_ap(NMAccessPoint *ap) {
+	if (ap == nullptr) {
+		return "unknown";
+	}
+
+	const NM80211ApFlags flags = nm_access_point_get_flags(ap);
+	const NM80211ApSecurityFlags wpa_flags = nm_access_point_get_wpa_flags(ap);
+	const NM80211ApSecurityFlags rsn_flags = nm_access_point_get_rsn_flags(ap);
+
+	if ((flags & NM_802_11_AP_FLAGS_PRIVACY) == 0) {
+		return "open";
+	}
+
+	if (rsn_flags & (NM_802_11_AP_SEC_KEY_MGMT_SAE)) {
+		return "wpa3";
+	}
+
+	if (rsn_flags & (NM_802_11_AP_SEC_KEY_MGMT_PSK)) {
+		return "wpa2";
+	}
+
+	if (wpa_flags & (NM_802_11_AP_SEC_KEY_MGMT_PSK)) {
+		return "wpa";
+	}
+
+	if (flags & NM_802_11_AP_FLAGS_WPS) {
+		return "wps";
+	}
+
+	return "secured";
+}
+
+bool is_ap_secured(NMAccessPoint *ap) {
+	const godot::String security = security_type_from_ap(ap);
+	return security != "open";
+}
+
+ConnectionState map_device_state(NMDeviceState state) {
+	switch (state) {
+		case NM_DEVICE_STATE_ACTIVATED:
+			return ConnectionState::CONNECTED;
+		case NM_DEVICE_STATE_PREPARE:
+		case NM_DEVICE_STATE_CONFIG:
+		case NM_DEVICE_STATE_NEED_AUTH:
+		case NM_DEVICE_STATE_IP_CONFIG:
+		case NM_DEVICE_STATE_IP_CHECK:
+		case NM_DEVICE_STATE_SECONDARIES:
+			return ConnectionState::CONNECTING;
+		case NM_DEVICE_STATE_FAILED:
+			return ConnectionState::FAILED;
+		default:
+			return ConnectionState::DISCONNECTED;
+	}
+}
+
+godot::String describe_nm_error(GError *err) {
+	if (err == nullptr) {
+		return godot::String();
+	}
+
+	const godot::String message = godot::String::utf8(err->message);
+	if (g_strstr_len(err->message, -1, "org.freedesktop.NetworkManager.PermissionDenied") != nullptr ||
+			g_strstr_len(err->message, -1, "Not authorized") != nullptr ||
+			err->code == G_DBUS_ERROR_ACCESS_DENIED) {
+		return "Permission denied. Approve the system dialog or configure polkit for your user.";
+	}
+	if (g_strstr_len(err->message, -1, "Secrets were required") != nullptr ||
+			g_strstr_len(err->message, -1, "802-11-wireless-security") != nullptr) {
+		return "Authentication failed. Check the password.";
+	}
+	if (g_strstr_len(err->message, -1, "No network with SSID") != nullptr) {
+		return "Network not found. Scan again and retry.";
+	}
+	return message;
+}
+
+void log_gerror(const godot::String &operation, GError *err) {
+	if (err == nullptr) {
+		return;
+	}
+	log_to_console("[WifiGD] " + operation + ": " + godot::String::utf8(err->message));
+	if (err->code != 0) {
+		log_to_console("  GError domain=" + godot::String::num_int64((int64_t)err->domain) +
+				" code=" + godot::String::num_int64((int64_t)err->code));
+	}
+}
+
+struct AsyncWaitContext {
+	GMainLoop *loop = nullptr;
+	GError *error = nullptr;
+	bool success = false;
+	NMActiveConnection *active = nullptr;
+};
+
+void activate_ready_cb(GObject *source, GAsyncResult *result, gpointer user_data) {
+	AsyncWaitContext *ctx = static_cast<AsyncWaitContext *>(user_data);
+	NMClient *client = NM_CLIENT(source);
+	GVariant *out_result = nullptr;
+	ctx->active = nm_client_add_and_activate_connection2_finish(client, result, &out_result, &ctx->error);
+	if (out_result != nullptr) {
+		g_variant_unref(out_result);
+	}
+	ctx->success = ctx->active != nullptr && ctx->error == nullptr;
+	if (ctx->loop != nullptr) {
+		g_main_loop_quit(ctx->loop);
+	}
+}
+
+void delete_wifigd_saved_connections(NMClient *client) {
+	if (client == nullptr) {
+		return;
+	}
+
+	for (int attempt = 0; attempt < 8; attempt++) {
+		NMRemoteConnection *remote = nm_client_get_connection_by_id(client, kWifiGdConnectionId);
+		if (remote == nullptr) {
+			return;
+		}
+
+		GError *error = nullptr;
+		if (!nm_remote_connection_delete(remote, nullptr, &error)) {
+			log_gerror("Delete WifiGD connection profile", error);
+			if (error != nullptr) {
+				g_error_free(error);
+			}
+			g_object_unref(remote);
+			return;
+		}
+
+		g_object_unref(remote);
+	}
+}
+
+bool run_main_loop_until(GMainLoop *loop, int timeout_sec) {
+	const gint64 deadline = g_get_monotonic_time() + (gint64)timeout_sec * G_TIME_SPAN_SECOND;
+	while (g_main_loop_is_running(loop)) {
+		if (!g_main_context_iteration(g_main_loop_get_context(loop), TRUE)) {
+			break;
+		}
+		if (g_get_monotonic_time() >= deadline) {
+			g_main_loop_quit(loop);
+			return false;
+		}
+	}
+	return true;
+}
+
+godot::String ip_config_address(NMIPConfig *ip_config) {
+	if (ip_config == nullptr) {
+		return godot::String();
+	}
+
+	const GPtrArray *addresses = nm_ip_config_get_addresses(ip_config);
+	if (addresses == nullptr || addresses->len == 0) {
+		return godot::String();
+	}
+
+	for (guint i = 0; i < addresses->len; i++) {
+		NMIPAddress *addr = static_cast<NMIPAddress *>(g_ptr_array_index(addresses, i));
+		if (addr == nullptr) {
+			continue;
+		}
+		const int family = nm_ip_address_get_family(addr);
+		if (family == AF_INET) {
+			return godot::String::utf8(nm_ip_address_get_address(addr));
+		}
+	}
+	return godot::String();
+}
+
+godot::String ip_config_gateway(NMIPConfig *ip_config) {
+	if (ip_config == nullptr) {
+		return godot::String();
+	}
+	const char *gateway = nm_ip_config_get_gateway(ip_config);
+	return gateway != nullptr ? godot::String::utf8(gateway) : godot::String();
+}
+
+godot::String ip_config_dns(NMIPConfig *ip_config) {
+	if (ip_config == nullptr) {
+		return godot::String();
+	}
+	const char *const *dns = nm_ip_config_get_nameservers(ip_config);
+	if (dns == nullptr || dns[0] == nullptr) {
+		return godot::String();
+	}
+	return godot::String::utf8(dns[0]);
+}
+
+void fill_ip_info_from_device(NMDevice *device, godot::String &ip, godot::String &gateway, godot::String &dns) {
+	NMIPConfig *ip4 = nm_device_get_ip4_config(device);
+	ip = ip_config_address(ip4);
+	gateway = ip_config_gateway(ip4);
+	dns = ip_config_dns(ip4);
+}
+
+godot::String active_ssid_for_device(NMDevice *device) {
+	NMActiveConnection *active = nm_device_get_active_connection(device);
+	if (active == nullptr) {
+		return godot::String();
+	}
+
+	NMRemoteConnection *remote = nm_active_connection_get_connection(active);
+	if (remote == nullptr) {
+		return godot::String();
+	}
+
+	NMSettingWireless *wireless = nm_connection_get_setting_wireless(NM_CONNECTION(remote));
+	if (wireless == nullptr) {
+		return godot::String();
+	}
+
+	return gbytes_to_ssid(nm_setting_wireless_get_ssid(wireless));
+}
+
+WifiNetwork access_point_to_network(NMAccessPoint *ap, NMDeviceWifi *device, NMAccessPoint *active_ap) {
+	WifiNetwork network;
+	if (ap == nullptr || device == nullptr) {
+		return network;
+	}
+
+	network.ssid = gbytes_to_ssid(nm_access_point_get_ssid(ap));
+	network.bssid = bssid_to_string(nm_access_point_get_bssid(ap));
+	network.signal_strength = nm_access_point_get_strength(ap);
+	network.frequency_mhz = (int)nm_access_point_get_frequency(ap);
+	frequency_to_band_and_channel((guint32)network.frequency_mhz, network.channel, network.band);
+	network.security_type = security_type_from_ap(ap);
+	network.is_secured = is_ap_secured(ap);
+	network.adapter_id = godot::String::utf8(nm_device_get_iface(NM_DEVICE(device)));
+
+	if (active_ap != nullptr) {
+		const char *active_bssid = nm_access_point_get_bssid(active_ap);
+		const char *ap_bssid = nm_access_point_get_bssid(ap);
+		if (active_bssid != nullptr && ap_bssid != nullptr && g_strcmp0(active_bssid, ap_bssid) == 0) {
+			network.is_connected = true;
+			network.security_type = "connected";
+		}
+	}
+
+	return network;
+}
+
+} // namespace
+
+NetworkBackendLinux::NetworkBackendLinux() {
+	GError *error = nullptr;
+	client = nm_client_new(nullptr, &error);
+	if (client == nullptr) {
+		if (error != nullptr) {
+			log_gerror("NetworkManager init", error);
+			last_error = "NetworkManager is not available.";
+			g_error_free(error);
+		} else {
+			last_error = "NetworkManager is not available.";
+		}
+	}
+}
+
+NetworkBackendLinux::~NetworkBackendLinux() {
+	if (client != nullptr) {
+		g_object_unref(client);
+		client = nullptr;
+	}
+}
 
 void NetworkBackendLinux::set_error(const godot::String &message) {
 	last_error = message;
 }
 
+bool NetworkBackendLinux::ensure_nm_available() {
+	if (client == nullptr) {
+		if (last_error.is_empty()) {
+			last_error = "NetworkManager is not available.";
+		}
+		return false;
+	}
+	return true;
+}
+
+NMDeviceWifi *NetworkBackendLinux::resolve_wifi_device(const godot::String &adapter_id) {
+	if (!ensure_nm_available()) {
+		return nullptr;
+	}
+
+	const godot::CharString adapter_utf8 = adapter_id.utf8();
+	const char *iface_filter = adapter_utf8.length() > 0 ? adapter_utf8.get_data() : nullptr;
+
+	if (iface_filter != nullptr) {
+		NMDevice *device = nm_client_get_device_by_iface(client, iface_filter);
+		if (device == nullptr) {
+			set_error(godot::vformat("Wi-Fi adapter '%s' was not found.", adapter_id));
+			return nullptr;
+		}
+		if (!NM_IS_DEVICE_WIFI(device)) {
+			set_error(godot::vformat("Adapter '%s' is not a Wi-Fi device.", adapter_id));
+			return nullptr;
+		}
+		return NM_DEVICE_WIFI(device);
+	}
+
+	const GPtrArray *devices = nm_client_get_devices(client);
+	if (devices == nullptr) {
+		set_error("No network devices found.");
+		return nullptr;
+	}
+
+	for (guint i = 0; i < devices->len; i++) {
+		NMDevice *device = static_cast<NMDevice *>(g_ptr_array_index(devices, i));
+		if (device != nullptr && NM_IS_DEVICE_WIFI(device)) {
+			return NM_DEVICE_WIFI(device);
+		}
+	}
+
+	set_error("No Wi-Fi adapter found.");
+	return nullptr;
+}
+
 bool NetworkBackendLinux::is_wifi_enabled() {
-	set_error("Linux Wi-Fi radio state query is not yet implemented. Use NetworkManager D-Bus.");
-	return false;
+	if (!ensure_nm_available()) {
+		return false;
+	}
+	last_error = "";
+	return nm_client_wireless_get_enabled(client) != FALSE;
 }
 
 bool NetworkBackendLinux::set_wifi_enabled(bool enabled) {
-	set_error(enabled
-			? "Linux Wi-Fi radio enable is not yet implemented."
-			: "Linux Wi-Fi radio disable is not yet implemented.");
+	if (!ensure_nm_available()) {
+		return false;
+	}
+
+	nm_client_wireless_set_enabled(client, enabled ? TRUE : FALSE);
+
+	for (int attempt = 0; attempt < 10; attempt++) {
+		if (nm_client_wireless_get_enabled(client) == (enabled ? TRUE : FALSE)) {
+			last_error = "";
+			return true;
+		}
+		g_usleep(100 * 1000);
+	}
+
+	set_error("Permission denied. Approve the system dialog or configure polkit for your user.");
 	return false;
 }
 
-std::vector<WifiNetwork> NetworkBackendLinux::scan_wifi_networks(const godot::String &adapter_id) {
-	set_error("Linux Wi-Fi scan is not yet implemented. Planned: NetworkManager via libnm.");
-	(void)adapter_id;
-	return {};
+std::vector<NetworkAdapter> NetworkBackendLinux::get_network_adapters() {
+	std::vector<NetworkAdapter> adapters;
+	if (!ensure_nm_available()) {
+		return adapters;
+	}
+
+	const GPtrArray *devices = nm_client_get_devices(client);
+	if (devices == nullptr) {
+		set_error("No network devices found.");
+		return adapters;
+	}
+
+	last_error = "";
+	for (guint i = 0; i < devices->len; i++) {
+		NMDevice *device = static_cast<NMDevice *>(g_ptr_array_index(devices, i));
+		if (device == nullptr) {
+			continue;
+		}
+
+		NetworkAdapter adapter;
+		adapter.id = godot::String::utf8(nm_device_get_iface(device));
+		adapter.name = adapter.id;
+
+		const char *product = nm_device_get_product(device);
+		const char *driver = nm_device_get_driver(device);
+		if (product != nullptr && product[0] != '\0') {
+			adapter.description = godot::String::utf8(product);
+		} else if (driver != nullptr) {
+			adapter.description = godot::String::utf8(driver);
+		}
+
+		const char *hw_addr = nm_device_get_hw_address(device);
+		if (hw_addr != nullptr) {
+			adapter.mac_address = godot::String::utf8(hw_addr);
+		}
+
+		fill_ip_info_from_device(device, adapter.ip_address, adapter.gateway, adapter.dns_primary);
+
+		const NMDeviceState state = nm_device_get_state(device);
+		adapter.is_up = state != NM_DEVICE_STATE_UNMANAGED && state != NM_DEVICE_STATE_UNAVAILABLE;
+		adapter.is_connected = state == NM_DEVICE_STATE_ACTIVATED;
+
+		if (NM_IS_DEVICE_WIFI(device)) {
+			adapter.type = AdapterType::WIFI;
+		} else if (NM_IS_DEVICE_ETHERNET(device)) {
+			adapter.type = AdapterType::ETHERNET;
+		} else {
+			adapter.type = AdapterType::OTHER;
+		}
+
+		adapters.push_back(adapter);
+	}
+
+	if (adapters.empty()) {
+		set_error("No network adapters found.");
+	}
+
+	return adapters;
 }
 
-bool NetworkBackendLinux::connect_to_wifi(const godot::String &ssid, const godot::String &password, const godot::String &adapter_id) {
-	set_error(vformat("Linux connect to '%s' is not yet implemented. Planned: NetworkManager via libnm.", ssid));
-	(void)password;
-	(void)adapter_id;
+ConnectivityInfo NetworkBackendLinux::get_connectivity_info() {
+	ConnectivityInfo info;
+	if (!ensure_nm_available()) {
+		return info;
+	}
+
+	NMDeviceWifi *wifi = resolve_wifi_device("");
+	if (wifi == nullptr) {
+		return info;
+	}
+
+	NMDevice *device = NM_DEVICE(wifi);
+	const NMDeviceState state = nm_device_get_state(device);
+	info.state = map_device_state(state);
+	info.is_wifi_connected = state == NM_DEVICE_STATE_ACTIVATED;
+	info.connected_ssid = active_ssid_for_device(device);
+	fill_ip_info_from_device(device, info.local_ip, info.gateway, info.dns_primary);
+	info.has_internet = info.is_wifi_connected && !info.local_ip.is_empty();
+	last_error = "";
+	return info;
+}
+
+std::vector<WifiNetwork> NetworkBackendLinux::scan_wifi_networks(const godot::String &adapter_id) {
+	std::vector<WifiNetwork> networks;
+	if (!ensure_nm_available()) {
+		return networks;
+	}
+
+	NMDeviceWifi *wifi = resolve_wifi_device(adapter_id);
+	if (wifi == nullptr) {
+		return networks;
+	}
+
+	if (!nm_client_wireless_get_enabled(client)) {
+		set_error("Wi-Fi radio is disabled.");
+		return networks;
+	}
+
+	GError *scan_error = nullptr;
+	const gboolean scan_ok = nm_device_wifi_request_scan(wifi, nullptr, &scan_error);
+	if (!scan_ok) {
+		log_gerror("Wi-Fi scan", scan_error);
+		set_error(scan_error != nullptr ? describe_nm_error(scan_error) : "Wi-Fi scan failed.");
+		if (scan_error != nullptr) {
+			g_error_free(scan_error);
+		}
+		return networks;
+	}
+
+	g_usleep(1500 * 1000);
+
+	const GPtrArray *access_points = nm_device_wifi_get_access_points(wifi);
+	NMAccessPoint *active_ap = nm_device_wifi_get_active_access_point(wifi);
+	if (access_points == nullptr || access_points->len == 0) {
+		set_error("No Wi-Fi networks found.");
+		return networks;
+	}
+
+	last_error = "";
+	networks.reserve(access_points->len);
+	for (guint i = 0; i < access_points->len; i++) {
+		NMAccessPoint *ap = static_cast<NMAccessPoint *>(g_ptr_array_index(access_points, i));
+		WifiNetwork network = access_point_to_network(ap, wifi, active_ap);
+		if (network.ssid.is_empty()) {
+			continue;
+		}
+		networks.push_back(network);
+	}
+
+	std::sort(networks.begin(), networks.end(), [](const WifiNetwork &a, const WifiNetwork &b) {
+		return a.signal_strength > b.signal_strength;
+	});
+
+	if (networks.empty()) {
+		set_error("No Wi-Fi networks found.");
+	}
+
+	return networks;
+}
+
+bool NetworkBackendLinux::connect_to_wifi(
+		const godot::String &ssid,
+		const godot::String &password,
+		const godot::String &adapter_id) {
+	if (!ensure_nm_available()) {
+		return false;
+	}
+
+	if (ssid.is_empty()) {
+		set_error("SSID is required.");
+		return false;
+	}
+
+	NMDeviceWifi *wifi = resolve_wifi_device(adapter_id);
+	if (wifi == nullptr) {
+		return false;
+	}
+
+	const godot::CharString ssid_utf8 = ssid.utf8();
+	const godot::CharString password_utf8 = password.utf8();
+
+	NMConnection *connection = nm_simple_connection_new();
+
+	NMSettingConnection *setting_connection = NM_SETTING_CONNECTION(nm_setting_connection_new());
+	g_object_set(
+			G_OBJECT(setting_connection),
+			NM_SETTING_CONNECTION_ID,
+			"WifiGD Connection",
+			NM_SETTING_CONNECTION_TYPE,
+			"802-11-wireless",
+			NM_SETTING_CONNECTION_AUTOCONNECT,
+			FALSE,
+			nullptr);
+	nm_connection_add_setting(connection, NM_SETTING(setting_connection));
+
+	GBytes *ssid_bytes = g_bytes_new(ssid_utf8.get_data(), ssid_utf8.length());
+	NMSettingWireless *setting_wireless = NM_SETTING_WIRELESS(nm_setting_wireless_new());
+	g_object_set(
+			G_OBJECT(setting_wireless),
+			NM_SETTING_WIRELESS_SSID,
+			ssid_bytes,
+			NM_SETTING_WIRELESS_MODE,
+			"infrastructure",
+			nullptr);
+	g_bytes_unref(ssid_bytes);
+	nm_connection_add_setting(connection, NM_SETTING(setting_wireless));
+
+	NMSettingIP4Config *setting_ip4 = NM_SETTING_IP4_CONFIG(nm_setting_ip4_config_new());
+	g_object_set(G_OBJECT(setting_ip4), NM_SETTING_IP_CONFIG_METHOD, NM_SETTING_IP4_CONFIG_METHOD_AUTO, nullptr);
+	nm_connection_add_setting(connection, NM_SETTING(setting_ip4));
+
+	NMSettingIP6Config *setting_ip6 = NM_SETTING_IP6_CONFIG(nm_setting_ip6_config_new());
+	g_object_set(G_OBJECT(setting_ip6), NM_SETTING_IP_CONFIG_METHOD, NM_SETTING_IP6_CONFIG_METHOD_AUTO, nullptr);
+	nm_connection_add_setting(connection, NM_SETTING(setting_ip6));
+
+	if (!password.is_empty()) {
+		NMSettingWirelessSecurity *setting_security =
+				NM_SETTING_WIRELESS_SECURITY(nm_setting_wireless_security_new());
+		g_object_set(
+				G_OBJECT(setting_security),
+				NM_SETTING_WIRELESS_SECURITY_KEY_MGMT,
+				"wpa-psk",
+				NM_SETTING_WIRELESS_SECURITY_PSK,
+				password_utf8.get_data(),
+				nullptr);
+		nm_connection_add_setting(connection, NM_SETTING(setting_security));
+	}
+
+	GVariant *options = g_variant_new_parsed("@a{sv} { 'persist': <'memory'> }");
+
+	AsyncWaitContext ctx;
+	ctx.loop = g_main_loop_new(nullptr, FALSE);
+	nm_client_add_and_activate_connection2(
+			client,
+			connection,
+			NM_DEVICE(wifi),
+			nullptr,
+			options,
+			nullptr,
+			activate_ready_cb,
+			&ctx);
+	g_variant_unref(options);
+	run_main_loop_until(ctx.loop, kConnectTimeoutSec);
+	g_main_loop_unref(ctx.loop);
+	g_object_unref(connection);
+
+	if (!ctx.success) {
+		log_gerror("Connect to Wi-Fi", ctx.error);
+		set_error(ctx.error != nullptr ? describe_nm_error(ctx.error) : "Connection timed out.");
+		if (ctx.active != nullptr) {
+			g_object_unref(ctx.active);
+		}
+		if (ctx.error != nullptr) {
+			g_error_free(ctx.error);
+		}
+		return false;
+	}
+	if (ctx.error != nullptr) {
+		g_error_free(ctx.error);
+	}
+
+	NMDevice *device = NM_DEVICE(wifi);
+	const gint64 deadline = g_get_monotonic_time() + (gint64)kConnectTimeoutSec * G_TIME_SPAN_SECOND;
+	while (g_get_monotonic_time() < deadline) {
+		const NMDeviceState state = nm_device_get_state(device);
+		if (state == NM_DEVICE_STATE_ACTIVATED) {
+			if (ctx.active != nullptr) {
+				g_object_unref(ctx.active);
+			}
+			last_error = "";
+			return true;
+		}
+		if (state == NM_DEVICE_STATE_FAILED) {
+			break;
+		}
+		g_usleep((gulong)kConnectPollIntervalMs * 1000);
+	}
+
+	if (ctx.active != nullptr) {
+		g_object_unref(ctx.active);
+	}
+	set_error("Connection timed out before the network became active.");
 	return false;
 }
 
 bool NetworkBackendLinux::disconnect_from_wifi(const godot::String &adapter_id) {
-	set_error("Linux Wi-Fi disconnect is not yet implemented. Planned: NetworkManager via libnm.");
-	(void)adapter_id;
-	return false;
-}
+	if (!ensure_nm_available()) {
+		return false;
+	}
 
-ConnectivityInfo NetworkBackendLinux::get_connectivity_info() {
-	set_error("Linux connectivity info is not yet implemented.");
-	return {};
-}
+	NMDeviceWifi *wifi = resolve_wifi_device(adapter_id);
+	if (wifi == nullptr) {
+		return false;
+	}
 
-std::vector<NetworkAdapter> NetworkBackendLinux::get_network_adapters() {
-	set_error("Linux adapter enumeration is not yet implemented. Planned: getifaddrs / rtnetlink.");
-	return {};
+	GError *error = nullptr;
+	const gboolean ok = nm_device_disconnect(NM_DEVICE(wifi), nullptr, &error);
+	if (!ok) {
+		log_gerror("Disconnect from Wi-Fi", error);
+		set_error(describe_nm_error(error));
+		if (error != nullptr) {
+			g_error_free(error);
+		}
+		return false;
+	}
+
+	delete_wifigd_saved_connections(client);
+	last_error = "";
+	return true;
 }
 
 godot::String NetworkBackendLinux::get_last_error() const {

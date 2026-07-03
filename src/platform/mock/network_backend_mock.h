@@ -2,27 +2,16 @@
 
 #include "../network_backend.h"
 
-struct _NMClient;
-typedef struct _NMClient NMClient;
-
-struct _NMDeviceWifi;
-typedef struct _NMDeviceWifi NMDeviceWifi;
-
 namespace wifigd {
 
-class NetworkBackendLinux : public NetworkBackend {
+class NetworkBackendMock : public NetworkBackend {
 private:
-	NMClient *client = nullptr;
 	godot::String last_error;
-
-	void set_error(const godot::String &message);
-	bool ensure_nm_available();
-	NMDeviceWifi *resolve_wifi_device(const godot::String &adapter_id);
+	bool wifi_enabled = true;
+	bool connected = true;
+	int scan_call_count = 0;
 
 public:
-	NetworkBackendLinux();
-	~NetworkBackendLinux() override;
-
 	bool is_wifi_enabled() override;
 	bool set_wifi_enabled(bool enabled) override;
 

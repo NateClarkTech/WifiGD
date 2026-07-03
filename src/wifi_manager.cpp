@@ -51,6 +51,20 @@ Array adapters_to_array(const std::vector<wifigd::NetworkAdapter> &adapters) {
 	return result;
 }
 
+int connection_state_from_dict(const Dictionary &info) {
+	const String state = info.get("state", "disconnected");
+	if (state == "connected") {
+		return static_cast<int>(wifigd::ConnectionState::CONNECTED);
+	}
+	if (state == "connecting") {
+		return static_cast<int>(wifigd::ConnectionState::CONNECTING);
+	}
+	if (state == "failed") {
+		return static_cast<int>(wifigd::ConnectionState::FAILED);
+	}
+	return static_cast<int>(wifigd::ConnectionState::DISCONNECTED);
+}
+
 } // namespace
 
 WifiManager::WifiManager() {
@@ -58,6 +72,23 @@ WifiManager::WifiManager() {
 }
 
 WifiManager::~WifiManager() = default;
+
+void WifiManager::_ready() {
+	set_process(true);
+	_poll_connectivity();
+}
+
+void WifiManager::_exit_tree() {
+	set_process(false);
+}
+
+void WifiManager::_process(double delta) {
+	connectivity_poll_timer += delta;
+	if (connectivity_poll_timer >= CONNECTIVITY_POLL_INTERVAL_SEC) {
+		connectivity_poll_timer = 0.0;
+		_poll_connectivity();
+	}
+}
 
 void WifiManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_wifi_enabled"), &WifiManager::is_wifi_enabled);
@@ -73,7 +104,11 @@ void WifiManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("disconnect_from_wifi_async", "adapter_id"), &WifiManager::disconnect_from_wifi_async, DEFVAL(""));
 
 	ClassDB::bind_method(D_METHOD("get_connectivity_info"), &WifiManager::get_connectivity_info);
+	ClassDB::bind_method(D_METHOD("get_cached_connectivity"), &WifiManager::get_cached_connectivity);
+	ClassDB::bind_method(D_METHOD("get_connection_state"), &WifiManager::get_connection_state);
+
 	ClassDB::bind_method(D_METHOD("get_network_adapters"), &WifiManager::get_network_adapters);
+	ClassDB::bind_method(D_METHOD("get_cached_adapters"), &WifiManager::get_cached_adapters);
 	ClassDB::bind_method(D_METHOD("fetch_adapters_async"), &WifiManager::fetch_adapters_async);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &WifiManager::get_last_error);
 
@@ -86,11 +121,44 @@ void WifiManager::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("connect_completed", PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
 	ADD_SIGNAL(MethodInfo("disconnect_completed", PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
 	ADD_SIGNAL(MethodInfo("adapters_updated", PropertyInfo(Variant::ARRAY, "adapters"), PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
+	ADD_SIGNAL(MethodInfo("connectivity_changed", PropertyInfo(Variant::DICTIONARY, "info")));
+	ADD_SIGNAL(MethodInfo("connection_state_changed", PropertyInfo(Variant::INT, "state"), PropertyInfo(Variant::STRING, "ssid")));
+	ADD_SIGNAL(MethodInfo("wifi_enabled_changed", PropertyInfo(Variant::BOOL, "enabled")));
 
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::DISCONNECTED));
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::CONNECTING));
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::CONNECTED));
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::FAILED));
+}
+
+void WifiManager::_poll_connectivity() {
+	Dictionary info = get_connectivity_info();
+	_update_cached_connectivity(info);
+
+	const bool enabled = is_wifi_enabled();
+	if (enabled != last_wifi_enabled) {
+		last_wifi_enabled = enabled;
+		emit_signal("wifi_enabled_changed", enabled);
+	}
+}
+
+void WifiManager::_update_cached_connectivity(const Dictionary &info) {
+	const int state = connection_state_from_dict(info);
+	const String ssid = info.get("connected_ssid", "");
+
+	if (state != last_connection_state || ssid != cached_connectivity.get("connected_ssid", "")) {
+		last_connection_state = state;
+		emit_signal("connection_state_changed", state, ssid);
+	}
+
+	if (info != cached_connectivity) {
+		cached_connectivity = info;
+		emit_signal("connectivity_changed", cached_connectivity);
+	}
+}
+
+void WifiManager::_update_cached_adapters(const Array &adapters) {
+	cached_adapters = adapters;
 }
 
 bool WifiManager::is_wifi_enabled() const {
@@ -99,8 +167,17 @@ bool WifiManager::is_wifi_enabled() const {
 }
 
 bool WifiManager::set_wifi_enabled(bool enabled) {
-	std::lock_guard<std::mutex> lock(backend_mutex);
-	return backend ? backend->set_wifi_enabled(enabled) : false;
+	bool result = false;
+	{
+		std::lock_guard<std::mutex> lock(backend_mutex);
+		result = backend ? backend->set_wifi_enabled(enabled) : false;
+	}
+	_flush_console_logs();
+	if (result) {
+		last_wifi_enabled = enabled;
+		emit_signal("wifi_enabled_changed", enabled);
+	}
+	return result;
 }
 
 Array WifiManager::scan_wifi_networks(const String &adapter_id) const {
@@ -147,8 +224,8 @@ void WifiManager::_scan_native_task(void *p_userdata) {
 		} else {
 			networks = networks_to_array(manager->backend->scan_wifi_networks(adapter_id));
 			message = manager->backend->get_last_error();
-			if (networks.is_empty()) {
-				error = message.is_empty() ? ERR_CANT_CONNECT : ERR_CANT_CONNECT;
+			if (networks.is_empty() && !message.is_empty()) {
+				error = ERR_CANT_CONNECT;
 			}
 		}
 	}
@@ -178,6 +255,7 @@ Error WifiManager::connect_to_wifi(const String &ssid, const String &password, c
 		error = backend->connect_to_wifi(ssid, password, adapter_id) ? OK : ERR_CANT_CONNECT;
 	}
 	_flush_console_logs();
+	_poll_connectivity();
 	return error;
 }
 
@@ -230,6 +308,7 @@ void WifiManager::_emit_connect_completed() {
 	_flush_console_logs();
 	connect_in_progress = false;
 	emit_signal("connect_completed", pending_error, pending_message);
+	_poll_connectivity();
 }
 
 Error WifiManager::disconnect_from_wifi(const String &adapter_id) {
@@ -242,6 +321,7 @@ Error WifiManager::disconnect_from_wifi(const String &adapter_id) {
 		error = backend->disconnect_from_wifi(adapter_id) ? OK : ERR_CANT_CONNECT;
 	}
 	_flush_console_logs();
+	_poll_connectivity();
 	return error;
 }
 
@@ -290,6 +370,7 @@ void WifiManager::_emit_disconnect_completed() {
 	_flush_console_logs();
 	disconnect_in_progress = false;
 	emit_signal("disconnect_completed", pending_error, pending_message);
+	_poll_connectivity();
 }
 
 Dictionary WifiManager::get_connectivity_info() const {
@@ -300,12 +381,24 @@ Dictionary WifiManager::get_connectivity_info() const {
 	return backend->get_connectivity_info().to_dict();
 }
 
+Dictionary WifiManager::get_cached_connectivity() const {
+	return cached_connectivity;
+}
+
+int WifiManager::get_connection_state() const {
+	return last_connection_state;
+}
+
 Array WifiManager::get_network_adapters() const {
 	std::lock_guard<std::mutex> lock(backend_mutex);
 	if (!backend) {
 		return Array();
 	}
 	return adapters_to_array(backend->get_network_adapters());
+}
+
+Array WifiManager::get_cached_adapters() const {
+	return cached_adapters;
 }
 
 void WifiManager::fetch_adapters_async() {
@@ -355,6 +448,7 @@ void WifiManager::_adapters_native_task(void *p_userdata) {
 void WifiManager::_emit_adapters_updated() {
 	_flush_console_logs();
 	adapters_in_progress = false;
+	_update_cached_adapters(pending_networks);
 	emit_signal("adapters_updated", pending_networks, pending_error, pending_message);
 }
 

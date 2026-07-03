@@ -9,10 +9,14 @@ Cross-platform Wi-Fi management for Godot 4 via GDExtension. Enumerate adapters,
 
 ## API
 
-`WifiManager` extends `RefCounted`. Create an instance in GDScript — it is not an autoload by default.
+`WifiManager` extends `Node`. Register it as an autoload singleton (recommended) or add the provided scene to your tree.
 
 ```gdscript
-var wifi := WifiManager.new()
+# project.godot autoload (name must differ from the WifiManager class):
+# WiFi="*res://addons/WifiGD/wifi_manager_autoload.tscn"
+
+func _ready() -> void:
+    WiFi.scan_completed.connect(_on_scan_done)
 ```
 
 ### Methods
@@ -30,6 +34,9 @@ var wifi := WifiManager.new()
 | `get_network_adapters` | — | `Array` | **Sync.** Returns the current list of network adapters. |
 | `fetch_adapters_async` | — | `void` | **Async.** Refreshes adapters; result arrives via `adapters_updated`. |
 | `get_connectivity_info` | — | `Dictionary` | **Sync.** Returns connection state, SSID, IP, gateway, and DNS. |
+| `get_cached_connectivity` | — | `Dictionary` | **Sync.** Returns the last cached connectivity snapshot (updated by polling). |
+| `get_connection_state` | — | `int` | **Sync.** Returns cached `DISCONNECTED` / `CONNECTING` / `CONNECTED` / `FAILED`. |
+| `get_cached_adapters` | — | `Array` | **Sync.** Returns the last cached adapter list. |
 | `get_last_error` | — | `String` | Returns a short, user-facing message for the last failure. Detailed OS errors are logged to the Godot **Output** panel separately. |
 
 Empty `adapter_id` uses the default / first Wi-Fi adapter on the platform.
@@ -42,6 +49,9 @@ Empty `adapter_id` uses the default / first Wi-Fi adapter on the platform.
 | `connect_completed` | `error: int`, `message: String` | Emitted when an async connect finishes. |
 | `disconnect_completed` | `error: int`, `message: String` | Emitted when an async disconnect finishes. |
 | `adapters_updated` | `adapters: Array`, `error: int`, `message: String` | Emitted when an async adapter refresh finishes. `adapters` is an array of `NetworkAdapter` dictionaries. |
+| `connectivity_changed` | `info: Dictionary` | Emitted when connectivity state changes (polled ~every 2s on the autoload). |
+| `connection_state_changed` | `state: int`, `ssid: String` | Emitted when connection state or active SSID changes. |
+| `wifi_enabled_changed` | `enabled: bool` | Emitted when the Wi-Fi radio enabled state changes. |
 
 `error` is a Godot `Error` code (`OK`, `ERR_CANT_CONNECT`, `ERR_BUSY`, etc.). `message` is friendly text for UI logs.
 
@@ -62,22 +72,24 @@ Platform backend status for each method. **Working** means the OS action reliabl
 
 | Function | Windows | Linux | macOS |
 |----------|---------|-------|-------|
-| `is_wifi_enabled` | Partial | Not implemented | Not implemented |
-| `set_wifi_enabled` | Partial | Not implemented | Not implemented |
-| `scan_wifi_networks` | Partial | Not implemented | Not implemented |
-| `scan_wifi_networks_async` | Partial | Not implemented | Not implemented |
-| `connect_to_wifi` | Partial | Not implemented | Not implemented |
-| `connect_to_wifi_async` | Partial | Not implemented | Not implemented |
-| `disconnect_from_wifi` | **Working** | Not implemented | Not implemented |
-| `disconnect_from_wifi_async` | **Working** | Not implemented | Not implemented |
-| `get_network_adapters` | Partial | Not implemented | Not implemented |
-| `fetch_adapters_async` | Partial | Not implemented | Not implemented |
-| `get_connectivity_info` | Partial | Not implemented | Not implemented |
+| `is_wifi_enabled` | Partial | **Working** | Not implemented |
+| `set_wifi_enabled` | Partial | Partial | Not implemented |
+| `scan_wifi_networks` | Partial | **Working** | Not implemented |
+| `scan_wifi_networks_async` | Partial | **Working** | Not implemented |
+| `connect_to_wifi` | Partial | **Working** | Not implemented |
+| `connect_to_wifi_async` | Partial | **Working** | Not implemented |
+| `disconnect_from_wifi` | **Working** | **Working** | Not implemented |
+| `disconnect_from_wifi_async` | **Working** | **Working** | Not implemented |
+| `get_network_adapters` | Partial | **Working** | Not implemented |
+| `fetch_adapters_async` | Partial | **Working** | Not implemented |
+| `get_connectivity_info` | Partial | **Working** | Not implemented |
 | `get_last_error` | Working | Working | Working |
 
 **Windows notes:** Scan returns cached / BSS results when active scan is denied. Connect sends a profile + connect request but does not reliably join a network in testing. Only disconnect is confirmed end-to-end.
 
-**Linux / macOS notes:** Backends in `src/platform/linux/` and `src/platform/macos/` are stubs — methods return empty data or `false` and set an error via `get_last_error()`. Linux (NetworkManager / libnm) is the priority platform.
+**Linux notes:** Requires NetworkManager (libnm). Connect/disconnect and radio toggle may prompt polkit authorization. Open and WPA2-PSK networks supported. IWD-only or ConnMan setups are not supported.
+
+**macOS notes:** Backend in `src/platform/macos/` is a stub.
 
 ---
 
@@ -169,13 +181,11 @@ No editor plugin is required — registration is via `WifiGD.gdextension`.
 ```gdscript
 extends Node
 
-var _wifi: WifiManager
-
 func _ready() -> void:
-    _wifi = WifiManager.new()
-    _wifi.scan_completed.connect(_on_scan_completed)
-    _wifi.disconnect_completed.connect(_on_disconnect_completed)
-    _wifi.fetch_adapters_async()
+    WiFi.scan_completed.connect(_on_scan_completed)
+    WiFi.disconnect_completed.connect(_on_disconnect_completed)
+    WiFi.connectivity_changed.connect(_on_connectivity_changed)
+    WiFi.fetch_adapters_async()
 
 func _on_scan_completed(networks: Array, error: int, message: String) -> void:
     if not message.is_empty():
@@ -184,7 +194,10 @@ func _on_scan_completed(networks: Array, error: int, message: String) -> void:
         print(net["ssid"], " ", net["signal_strength"], "%")
 
 func disconnect() -> void:
-    _wifi.disconnect_from_wifi_async()
+    WiFi.disconnect_from_wifi_async()
+
+func _on_connectivity_changed(info: Dictionary) -> void:
+    print("State: ", info.get("state"), " SSID: ", info.get("connected_ssid"))
 
 func _on_disconnect_completed(error: int, message: String) -> void:
     if error == OK:
@@ -236,9 +249,10 @@ WifiGD/
 
 | Linux additional | |
 |------------------|---|
-| Build deps | `libnm-dev`, `libglib2.0-dev`, `pkg-config` (Debian/Ubuntu) |
-| | `NetworkManager-libnm-devel`, `glib2-devel` (Fedora) |
-| Runtime | NetworkManager running, Wi-Fi enabled |
+| Build deps | `libnm-dev`, `pkg-config` (Debian/Ubuntu) |
+| | `NetworkManager-devel`, `pkg-config` (openSUSE) |
+| | `NetworkManager-libnm-devel`, `pkg-config` (Fedora) |
+| Runtime | NetworkManager running, Wi-Fi enabled; polkit for connect/radio |
 
 | Windows additional | |
 |--------------------|---|
@@ -258,23 +272,64 @@ Parallel builds: `scons platform=linux -j$(nproc)`
 
 ---
 
+## Tests
+
+Unit and integration tests use [GUT](https://github.com/bitwes/Gut) in the demo project.
+
+```bash
+./run_tests.sh
+```
+
+| Suite | Location | Backend |
+|-------|----------|---------|
+| Unit (19 tests) | `demo/tests/unit/test_wifi_manager.gd` | Mock (`WIFIGD_MOCK_BACKEND=1`) |
+| Linux integration (5 tests) | `demo/tests/integration/test_wifi_manager_linux.gd` | Real NetworkManager |
+
+The mock backend is enabled per-test via `OS.set_environment("WIFIGD_MOCK_BACKEND", "1")` before creating a `WifiManager` instance. Integration tests skip automatically on non-Linux platforms.
+
+Run only unit tests:
+
+```bash
+godot --headless --path demo -s addons/gut/gut_cmdln.gd -gconfig=res://.gutconfig.json -gdir=res://tests/unit/
+```
+
+### Real Wi-Fi connect tests (`.env`)
+
+Live connect/disconnect tests read credentials from `demo/.env` (gitignored):
+
+```bash
+cp demo/.env.example demo/.env
+# Edit demo/.env — set WIFI_SSID and WIFI_PASSWORD
+./run_real_wifi_tests.sh
+```
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `WIFI_SSID` | Yes | Network name to join |
+| `WIFI_PASSWORD` | No | Empty for open networks |
+| `WIFI_ADAPTER_ID` | No | e.g. `wlan0`; empty uses default adapter |
+
+Tests live in `demo/tests/live/` and use the **real NetworkManager backend** (not the mock). Connect may prompt for polkit/sudo approval. They are **not** run by `./run_tests.sh` — only via `./run_real_wifi_tests.sh`.
+
+---
+
 
 ## Roadmap
 
-### Now (Linux focus)
+### Now
 
-- [ ] libnm backend: adapters, scan, connect, disconnect
-- [ ] Linux `SConstruct` pkg-config wiring
-- [ ] Polkit / permission error messages
-- [ ] Verify connect actually reaches `ACTIVATED` state
+- [x] Linux libnm backend: adapters, scan, connect, disconnect
+- [x] Linux `SConstruct` pkg-config wiring
+- [x] Polkit / permission error messages
+- [x] `Node` autoload wrapper scene
 
 ### Next
 
 - [ ] Fix Windows connect end-to-end (association confirmation)
 - [ ] macOS CoreWLAN backend
-- [ ] Optional `Node` autoload wrapper scene
 - [ ] Platform capability probe (`get_platform_capabilities()`)
 - [ ] Saved networks / forget profile
+- [ ] libnm event thread (replace connectivity polling)
 
 ### Later
 

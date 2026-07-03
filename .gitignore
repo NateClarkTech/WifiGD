@@ -33,6 +33,10 @@ export/
 *.pck
 *.zip
 
+# Test credentials (copy demo/.env.example to demo/.env)
+demo/.env
+.env
+
 # IDE / OS
 .vs/
 .vscode/
