@@ -1,0 +1,28 @@
+{
+  "name": "search_docs",
+  "description": "Search the Godot documentation by term. Returns URLs to the full documentation for each matching term. The resulting URLs will need to have their page content fetched to see the documentation.",
+  "inputSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "searchTerm": {
+        "type": "string"
+      },
+      "version": {
+        "default": "stable",
+        "type": "string",
+        "enum": [
+          "stable",
+          "latest",
+          "4.6",
+          "4.5",
+          "4.4",
+          "4.3"
+        ]
+      }
+    },
+    "required": [
+      "searchTerm"
+    ]
+  }
+}

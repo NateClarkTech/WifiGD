@@ -1,0 +1,42 @@
+# Godot
+.godot/
+.import/
+
+# Build output
+addons/WifiGD/bin/*.dll
+addons/WifiGD/bin/*.so
+addons/WifiGD/bin/*.dylib
+demo/addons/WifiGD/bin/*.dll
+demo/addons/WifiGD/bin/*.so
+demo/addons/WifiGD/bin/*.dylib
+
+# Keep bin folders
+!addons/WifiGD/bin/.gitkeep
+!demo/addons/WifiGD/bin/.gitkeep
+
+# SCons
+.sconsign.dblite
+
+# godot-cpp build artifacts
+godot-cpp/bin/
+godot-cpp/gen/
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Export artifacts
+export/
+*.exe
+*.pck
+*.zip
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
