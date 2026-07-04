@@ -90,9 +90,10 @@ static func load_wifi_env() -> Dictionary:
 
 
 static func _dotenv_paths() -> PackedStringArray:
+	# Live tests run with --path demo; credentials live at the repo root (.env).
 	return PackedStringArray([
-		ProjectSettings.globalize_path("res://.env"),
 		ProjectSettings.globalize_path("res://../.env"),
+		ProjectSettings.globalize_path("res://.env"),
 	])
 
 
@@ -115,6 +116,30 @@ static func _merge_dotenv_file(path: String, env: Dictionary) -> void:
 
 		if env.has(key) and env[key].is_empty():
 			env[key] = value
+
+
+static func wait_until_disconnected(
+	manager: WifiManager, timeout_sec: float = 15.0, poll_sec: float = 0.5
+) -> bool:
+	if manager == null or not is_instance_valid(manager):
+		return false
+
+	var elapsed := 0.0
+	while elapsed < timeout_sec:
+		var info: Dictionary = manager.get_connectivity_info()
+		if not info.get("is_wifi_connected", true):
+			return true
+		await Engine.get_main_loop().create_timer(poll_sec).timeout
+		elapsed += poll_sec
+
+	return false
+
+
+static func is_connected_to_ssid(manager: WifiManager, ssid: String) -> bool:
+	if manager == null or not is_instance_valid(manager) or ssid.is_empty():
+		return false
+	var info: Dictionary = manager.get_connectivity_info()
+	return info.get("is_wifi_connected", false) and info.get("connected_ssid", "") == ssid
 
 
 static func disconnect_and_wait(manager: WifiManager, adapter_id: String = "", wait_sec: float = 2.0) -> void:

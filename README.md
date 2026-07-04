@@ -295,11 +295,11 @@ godot --headless --path demo -s addons/gut/gut_cmdln.gd -gconfig=res://.gutconfi
 
 ### Real Wi-Fi connect tests (`.env`)
 
-Live connect/disconnect tests read credentials from `demo/.env` (gitignored):
+Live connect/disconnect tests read credentials from `.env` at the repo root (gitignored):
 
 ```bash
-cp demo/.env.example demo/.env
-# Edit demo/.env — set WIFI_SSID and WIFI_PASSWORD
+cp .env.example .env
+# Edit .env — set WIFI_SSID and WIFI_PASSWORD
 ./run_real_wifi_tests.sh
 ```
 

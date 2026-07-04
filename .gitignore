@@ -33,8 +33,7 @@ export/
 *.pck
 *.zip
 
-# Test credentials (copy demo/.env.example to demo/.env)
-demo/.env
+# Test credentials (copy .env.example to .env at repo root)
 .env
 
 # IDE / OS
