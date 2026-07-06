@@ -39,3 +39,11 @@ export/
 *.swp
 .DS_Store
 Thumbs.db
+
+# AI / coding agents (local only — do not publish)
+agent-tools/
+mcps/
+plan.md
+.cursor/
+.agents/
+.grok/
