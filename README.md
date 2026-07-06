@@ -143,7 +143,7 @@ scons platform=linux target=template_release
 
 Binaries are written to `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`.
 
-Native libraries are **gitignored** — you must build locally (or CI) before running the demo.
+Prebuilt GDExtension binaries are committed under `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`. Rebuild with `scons` when you change native code, then commit updated `.dll` / `.so` / `.dylib` files for your platforms.
 
 ### Run the demo
 
@@ -243,7 +243,7 @@ func _on_disconnect_completed(error: int, message: String) -> void:
 WifiGD/
 ├── addons/WifiGD/
 │   ├── WifiGD.gdextension      # GDExtension manifest
-│   └── bin/                    # Built .dll / .so / .dylib (gitignored)
+│   └── bin/                    # Shipped .dll / .so / .dylib (tracked in git)
 ├── demo/                       # Test UI project
 │   ├── project.godot
 │   ├── scenes/main.tscn

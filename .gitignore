@@ -2,17 +2,12 @@
 .godot/
 .import/
 
-# Build output
-addons/WifiGD/bin/*.dll
-addons/WifiGD/bin/*.so
-addons/WifiGD/bin/*.dylib
-demo/addons/WifiGD/bin/*.dll
-demo/addons/WifiGD/bin/*.so
-demo/addons/WifiGD/bin/*.dylib
-
-# Keep bin folders
-!addons/WifiGD/bin/.gitkeep
-!demo/addons/WifiGD/bin/.gitkeep
+# GDExtension ship folder — compiled addons in bin/ are tracked (see addons/WifiGD/WifiGD.gdextension)
+# Ignore Windows/Godot temp locks when a DLL is in use
+addons/WifiGD/bin/~*
+demo/addons/WifiGD/bin/~*
+addons/WifiGD/bin/*.TMP
+demo/addons/WifiGD/bin/*.TMP
 
 # SCons
 .sconsign.dblite
