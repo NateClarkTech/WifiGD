@@ -6,8 +6,7 @@ var _wifi: WifiManager
 
 
 func before_each() -> void:
-	if OS.get_name() != "Linux":
-		pending("Linux integration tests only run on Linux.")
+	if WifiTestHelpers.skip_unless_real_wifi_platform(self):
 		return
 
 	OS.unset_environment(WifiTestHelpers.MOCK_ENV_VAR)
@@ -19,7 +18,7 @@ func before_each() -> void:
 func test_real_get_network_adapters_returns_wifi_adapter() -> void:
 	var adapters: Array = _wifi.get_network_adapters()
 	if adapters.is_empty():
-		pending("No adapters found (NetworkManager unavailable?): %s" % _wifi.get_last_error())
+		pending("No adapters found: %s" % _wifi.get_last_error())
 		return
 
 	var found_wifi := false
@@ -42,7 +41,6 @@ func test_real_get_connectivity_info_shape() -> void:
 
 
 func test_real_is_wifi_enabled_reflects_radio_state() -> void:
-	# Boolean return is enough; exact value depends on machine state.
 	var enabled: bool = _wifi.is_wifi_enabled()
 	assert_true(enabled == true or enabled == false)
 
@@ -60,9 +58,20 @@ func test_real_scan_wifi_networks_async() -> void:
 	var params = get_signal_parameters(_wifi, "scan_completed", 0)
 	var networks: Array = params[0]
 	var error: int = params[1]
+	var message: String = params[2] if params.size() > 2 else ""
 
 	if error != OK and networks.is_empty():
-		pending("Scan failed on this machine: %s" % params[2])
+		if OS.get_name() == "Windows" and (
+			message.to_lower().contains("access denied")
+			or message.to_lower().contains("location")
+			or message.to_lower().contains("cached")
+		):
+			pending(
+				"Scan unavailable on Windows (enable Location in Settings, or use cached results): %s"
+				% message
+			)
+		else:
+			pending("Scan failed on this machine: %s" % message)
 		return
 
 	for network in networks:

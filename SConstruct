@@ -17,6 +17,7 @@ sources = [
 
 if env["platform"] == "windows":
     sources.append("src/platform/windows/network_backend_windows.cpp")
+    sources.append("src/platform/windows/wlan_notification_waiter.cpp")
     env.Append(LIBS=["wlanapi", "iphlpapi", "ws2_32"])
 elif env["platform"] == "linux":
     sources.append("src/platform/linux/network_backend_linux.cpp")

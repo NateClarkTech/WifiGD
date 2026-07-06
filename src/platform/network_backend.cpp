@@ -2,6 +2,8 @@
 
 #include "mock/network_backend_mock.h"
 
+#include <godot_cpp/classes/os.hpp>
+
 #include <cstdlib>
 
 #if defined(_WIN32)
@@ -18,7 +20,18 @@ namespace wifigd {
 
 namespace {
 
+bool mock_flag_enabled(const godot::String &value) {
+	return !value.is_empty() && value != "0" && value.to_lower() != "false";
+}
+
 bool use_mock_backend() {
+	// Godot's OS.set_environment() is not always visible to std::getenv() on Windows.
+	if (godot::OS *os = godot::OS::get_singleton()) {
+		if (mock_flag_enabled(os->get_environment("WIFIGD_MOCK_BACKEND"))) {
+			return true;
+		}
+	}
+
 	const char *flag = std::getenv("WIFIGD_MOCK_BACKEND");
 	return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
 }

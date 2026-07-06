@@ -6,6 +6,40 @@ const ENV_WIFI_SSID := "WIFI_SSID"
 const ENV_WIFI_PASSWORD := "WIFI_PASSWORD"
 const ENV_WIFI_ADAPTER_ID := "WIFI_ADAPTER_ID"
 
+const SUPPORTED_REAL_WIFI_PLATFORMS := ["Linux", "Windows"]
+
+
+static func is_real_wifi_platform() -> bool:
+	return OS.get_name() in SUPPORTED_REAL_WIFI_PLATFORMS
+
+
+static func skip_unless_real_wifi_platform(gut) -> bool:
+	if is_real_wifi_platform():
+		return false
+	gut.pending(
+		"Real Wi-Fi tests run on Linux and Windows only (current platform: %s)." % OS.get_name()
+	)
+	return true
+
+
+static func is_connect_permission_denied(message: String) -> bool:
+	var lower := message.to_lower()
+	if OS.get_name() == "Linux":
+		return lower.contains("permission denied") or lower.contains("polkit")
+	if OS.get_name() == "Windows":
+		return (
+			lower.contains("access denied")
+			or lower.contains("location")
+			or lower.contains("administrator")
+		)
+	return false
+
+
+static func adapter_id_documentation() -> String:
+	if OS.get_name() == "Linux":
+		return "Linux interface name (e.g. wlan0), or empty for default"
+	return "Windows Wi-Fi adapter GUID, or empty for default"
+
 
 static func create_mock_manager(parent: Node) -> WifiManager:
 	OS.set_environment(MOCK_ENV_VAR, "1")
@@ -116,6 +150,24 @@ static func _merge_dotenv_file(path: String, env: Dictionary) -> void:
 
 		if env.has(key) and env[key].is_empty():
 			env[key] = value
+
+
+static func wait_until_has_ip(
+	manager: WifiManager, timeout_sec: float = 20.0, poll_sec: float = 0.5
+) -> Dictionary:
+	if manager == null or not is_instance_valid(manager):
+		return {}
+
+	var elapsed := 0.0
+	var info: Dictionary = {}
+	while elapsed < timeout_sec:
+		info = manager.get_connectivity_info()
+		if not info.get("local_ip", "").is_empty():
+			return info
+		await Engine.get_main_loop().create_timer(poll_sec).timeout
+		elapsed += poll_sec
+
+	return manager.get_connectivity_info()
 
 
 static func wait_until_disconnected(

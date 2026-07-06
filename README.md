@@ -3,7 +3,7 @@
 Cross-platform Wi-Fi management for Godot 4 via GDExtension. Enumerate adapters, scan networks, connect, disconnect, and read connectivity — from GDScript without blocking the main thread.
 
 **Godot:** 4.3+  
-**Status:** Early development. Planned features may be broken, unoptimized, and not work.
+**Status:** Early development. **Windows** and **Linux** backends are functional for scan, connect, disconnect, and connectivity. macOS is not implemented yet.
 
 ---
 
@@ -72,24 +72,53 @@ Platform backend status for each method. **Working** means the OS action reliabl
 
 | Function | Windows | Linux | macOS |
 |----------|---------|-------|-------|
-| `is_wifi_enabled` | Partial | **Working** | Not implemented |
+| `is_wifi_enabled` | **Working** | **Working** | Not implemented |
 | `set_wifi_enabled` | Partial | Partial | Not implemented |
-| `scan_wifi_networks` | Partial | **Working** | Not implemented |
-| `scan_wifi_networks_async` | Partial | **Working** | Not implemented |
-| `connect_to_wifi` | Partial | **Working** | Not implemented |
-| `connect_to_wifi_async` | Partial | **Working** | Not implemented |
+| `scan_wifi_networks` | **Working** | **Working** | Not implemented |
+| `scan_wifi_networks_async` | **Working** | **Working** | Not implemented |
+| `connect_to_wifi` | **Working** | **Working** | Not implemented |
+| `connect_to_wifi_async` | **Working** | **Working** | Not implemented |
 | `disconnect_from_wifi` | **Working** | **Working** | Not implemented |
 | `disconnect_from_wifi_async` | **Working** | **Working** | Not implemented |
-| `get_network_adapters` | Partial | **Working** | Not implemented |
-| `fetch_adapters_async` | Partial | **Working** | Not implemented |
-| `get_connectivity_info` | Partial | **Working** | Not implemented |
+| `get_network_adapters` | **Working** | **Working** | Not implemented |
+| `fetch_adapters_async` | **Working** | **Working** | Not implemented |
+| `get_connectivity_info` | **Working** | **Working** | Not implemented |
 | `get_last_error` | Working | Working | Working |
 
-**Windows notes:** Scan returns cached / BSS results when active scan is denied. Connect sends a profile + connect request but does not reliably join a network in testing. Only disconnect is confirmed end-to-end.
+**Windows notes:** Uses the Native Wi-Fi API (`wlanapi`). Scan waits for `wlan_notification_acm_scan_complete`; connect waits for `wlan_notification_acm_connection_complete`. Requires [Location permission](#permissions) for active scans. `set_wifi_enabled` may require running as administrator.
 
-**Linux notes:** Requires NetworkManager (libnm). Connect/disconnect and radio toggle may prompt polkit authorization. Open and WPA2-PSK networks supported. IWD-only or ConnMan setups are not supported.
+**Linux notes:** Requires NetworkManager (libnm). Connect, disconnect, and radio toggle may prompt [polkit authorization](#permissions). Open and WPA2-PSK networks supported. IWD-only or ConnMan setups are not supported.
 
 **macOS notes:** Backend in `src/platform/macos/` is a stub.
+
+---
+
+## Permissions
+
+Wi-Fi APIs on desktop OSes are gated by system policy. If scan or connect fails with access-denied style errors, check the platform requirements below.
+
+### Windows
+
+| Capability | Requirement |
+|------------|-------------|
+| **Scan for nearby networks** | **Location services must be on.** Settings → Privacy & security → Location → Location services **On**. Allow location access for the app (Godot / your exported game) when prompted. Without this, `WlanScan` and network list APIs return `ERROR_ACCESS_DENIED` and WifiGD falls back to cached results when available. |
+| **Connect / disconnect** | Usually works for the current user without elevation. Uses saved WLAN profiles via `WlanSetProfile` + `WlanConnect`. |
+| **Toggle Wi-Fi radio** | May require running Godot or your game **as administrator**. |
+| **Read current SSID / IP** | Associated network info works without extra prompts; full scan still follows location rules above. |
+
+Microsoft documents this behavior in [Changes to API behavior for Wi-Fi access and location](https://learn.microsoft.com/windows/win32/nativewifi/wi-fi-access-location-changes).
+
+### Linux
+
+| Capability | Requirement |
+|------------|-------------|
+| **Scan, connect, disconnect** | **NetworkManager** must be running. The user session needs permission to control networking — typically via **polkit**. Connect/disconnect or radio changes may show an authorization dialog (or fail with “Permission denied” in headless/CI unless policy allows it). |
+| **Equivalent to Windows Location** | There is no separate “location” toggle for Wi-Fi scan on Linux. Access is governed by NetworkManager + polkit (e.g. `org.freedesktop.NetworkManager.wifi.share.open`, `org.freedesktop.NetworkManager.network-control`). Ensure your user can modify connections (`nmcli` works without sudo on your machine). |
+| **Headless / CI** | Run tests as a user with passwordless polkit rules for NetworkManager, or expect connect tests to be **pending** when authorization is denied. |
+
+### macOS
+
+Not implemented — no permissions guidance yet.
 
 ---
 
@@ -172,7 +201,7 @@ No editor plugin is required — registration is via `WifiGD.gdextension`.
 | `state` | `String` | `disconnected`, `connecting`, `connected`, `failed` |
 | `is_wifi_connected` | `bool` | Associated with Wi-Fi |
 | `connected_ssid` | `String` | Active SSID |
-| `local_ip` | `String` | Assigned IPv4 |
+| `local_ip` | `String` | Assigned IP (IPv4 preferred, IPv6 fallback on Windows) |
 | `gateway` | `String` | Default gateway |
 | `dns_primary` | `String` | Primary DNS |
 
@@ -229,7 +258,7 @@ WifiGD/
 │       ├── network_backend.h   # Abstract backend interface
 │       ├── network_backend.cpp # Platform factory
 │       ├── windows/network_backend_windows.cpp
-│       ├── linux/network_backend_linux.cpp   # ← implement here
+│       ├── linux/network_backend_linux.cpp
 │       └── macos/network_backend_macos.cpp
 ├── SConstruct
 └── sync_addon.ps1              # Windows: copy DLL when demo is locked
@@ -257,7 +286,7 @@ WifiGD/
 | Windows additional | |
 |--------------------|---|
 | Build | Visual Studio Build Tools or MSVC |
-| Runtime | WLAN AutoConfig service, Wi-Fi adapter |
+| Runtime | WLAN AutoConfig service, Wi-Fi adapter, Location services enabled for scan |
 
 ### Commands
 
@@ -274,42 +303,71 @@ Parallel builds: `scons platform=linux -j$(nproc)`
 
 ## Tests
 
-Unit and integration tests use [GUT](https://github.com/bitwes/Gut) in the demo project.
+Tests use [GUT](https://github.com/bitwes/Gut) in the `demo/` project. GUT is installed under `demo/addons/gut/`.
+
+### Automated test suites
+
+| Suite | Tests | Location | Backend | Run by default? |
+|-------|-------|----------|---------|-----------------|
+| **Unit** | 19 | `demo/tests/unit/test_wifi_manager.gd` | Mock (`WIFIGD_MOCK_BACKEND=1`) | Yes (`run_tests`) |
+| **Integration** | 5 | `demo/tests/integration/test_wifi_manager_integration.gd` | Real OS (Linux + Windows) | Yes (`run_tests`) |
+| **Live** | 5 | `demo/tests/live/test_wifi_manager_real_connect.gd` | Real OS + your `.env` network | No (separate script) |
+
+**Unit tests** exercise the GDScript API without hardware: async signals, busy guards, mock scan/connect/disconnect, and cached state. They run on any platform where the GDExtension loads.
+
+**Integration tests** hit the real Windows or Linux backend: list adapters, read connectivity, async scan shape, and radio state. They skip on macOS. Scan may **pending** if permissions are missing (see [Permissions](#permissions)).
+
+**Live tests** connect to a real network named in `.env`, verify association and IP, disconnect once, then reconnect to restore your machine's Wi-Fi. They are destructive-adjacent (brief disconnect) — run only when you intend to test against your own AP.
+
+### Run unit + integration tests
 
 ```bash
-./run_tests.sh
+./run_tests.sh          # Linux / macOS
 ```
 
-| Suite | Location | Backend |
-|-------|----------|---------|
-| Unit (19 tests) | `demo/tests/unit/test_wifi_manager.gd` | Mock (`WIFIGD_MOCK_BACKEND=1`) |
-| Linux integration (5 tests) | `demo/tests/integration/test_wifi_manager_linux.gd` | Real NetworkManager |
+```powershell
+.\run_tests.ps1         # Windows
+```
 
-The mock backend is enabled per-test via `OS.set_environment("WIFIGD_MOCK_BACKEND", "1")` before creating a `WifiManager` instance. Integration tests skip automatically on non-Linux platforms.
-
-Run only unit tests:
+Or directly:
 
 ```bash
-godot --headless --path demo -s addons/gut/gut_cmdln.gd -gconfig=res://.gutconfig.json -gdir=res://tests/unit/
+godot --headless --path demo -s addons/gut/gut_cmdln.gd -gconfig=res://.gutconfig.json -gexit
 ```
 
-### Real Wi-Fi connect tests (`.env`)
+Unit tests only:
 
-Live connect/disconnect tests read credentials from `.env` at the repo root (gitignored):
+```bash
+godot --headless --path demo -s addons/gut/gut_cmdln.gd -gconfig=res://.gutconfig.json -gexit -gdir=res://tests/unit/
+```
+
+The mock backend is selected when `WIFIGD_MOCK_BACKEND=1` is set before creating `WifiManager`. Unit tests set this via `OS.set_environment()`; on Windows the extension also reads Godot's environment API so the mock is used reliably.
+
+### Live tests (real connect / disconnect)
+
+Live tests read credentials from `.env` at the **repo root** (`WifiGD/.env`, gitignored). The test helper also checks `demo/.env` and process environment variables.
 
 ```bash
 cp .env.example .env
 # Edit .env — set WIFI_SSID and WIFI_PASSWORD
-./run_real_wifi_tests.sh
+./run_real_wifi_tests.sh    # Linux
+```
+
+```powershell
+Copy-Item .env.example .env
+# Edit .env
+.\run_real_wifi_tests.ps1   # Windows
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `WIFI_SSID` | Yes | Network name to join |
 | `WIFI_PASSWORD` | No | Empty for open networks |
-| `WIFI_ADAPTER_ID` | No | e.g. `wlan0`; empty uses default adapter |
+| `WIFI_ADAPTER_ID` | No | Linux: `wlan0`; Windows: adapter GUID; empty = default |
 
-Tests live in `demo/tests/live/` and use the **real NetworkManager backend** (not the mock). Connect may prompt for polkit/sudo approval. They are **not** run by `./run_tests.sh` — only via `./run_real_wifi_tests.sh`.
+Live suite is **not** included in `demo/.gutconfig.json` (which only lists `unit/` and `integration/`). Always run via `run_real_wifi_tests` or `-gdir=res://tests/live/`.
+
+**Before live tests:** enable [Permissions](#permissions) (Windows Location; Linux NetworkManager + polkit). Close Godot before rebuilding the DLL, or run `.\sync_addon.ps1` on Windows if the demo copy is locked.
 
 ---
 
@@ -325,7 +383,7 @@ Tests live in `demo/tests/live/` and use the **real NetworkManager backend** (no
 
 ### Next
 
-- [ ] Fix Windows connect end-to-end (association confirmation)
+- [x] Fix Windows connect end-to-end (association confirmation)
 - [ ] macOS CoreWLAN backend
 - [ ] Platform capability probe (`get_platform_capabilities()`)
 - [ ] Saved networks / forget profile
@@ -340,12 +398,10 @@ Tests live in `demo/tests/live/` and use the **real NetworkManager backend** (no
 
 ## Contributing
 
-1. Pick a backend method in `network_backend_linux.cpp`.
-2. Implement against `NetworkBackend` — keep Godot calls off worker threads.
-3. Use `log_to_console()` for detailed logs, friendly strings for `set_error()`.
-4. Test with `demo/` before opening a PR.
-
-There are no commits on `master` yet — early contributions welcome.
+1. Implement against `NetworkBackend` in `src/platform/<os>/` — keep Godot calls off worker threads.
+2. Use `log_to_console()` for detailed logs, friendly strings for `set_error()`.
+3. Run `./run_tests.sh` or `.\run_tests.ps1` before opening a PR; use live tests when changing connect/scan behavior.
+4. Document new permission requirements in the [Permissions](#permissions) section.
 
 ---
 

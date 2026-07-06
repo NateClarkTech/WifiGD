@@ -2,12 +2,17 @@
 
 #include "../network_backend.h"
 
+#include <memory>
+
 namespace wifigd {
+
+class WlanNotificationWaiter;
 
 class NetworkBackendWindows : public NetworkBackend {
 private:
 	godot::String last_error;
 	void *wlan_handle = nullptr; // HANDLE, stored as void* to avoid windows.h in header
+	std::unique_ptr<WlanNotificationWaiter> notification_waiter;
 
 	bool ensure_wlan_handle();
 	void set_error(const godot::String &message);

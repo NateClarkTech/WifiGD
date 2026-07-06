@@ -1,4 +1,5 @@
 #include "network_backend_windows.h"
+#include "wlan_notification_waiter.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -25,6 +27,9 @@ namespace {
 
 constexpr DWORD kScanPollIntervalMs = 400;
 constexpr DWORD kScanPollAttempts = 20;
+constexpr DWORD kScanNotificationTimeoutMs = 5000;
+constexpr DWORD kConnectNotificationTimeoutMs = 30000;
+constexpr DWORD kConnectPollFallbackMs = 5000;
 constexpr DWORD kWlanApiVersion = 2;
 constexpr DWORD kAvailableNetworkFlags = WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_HIDDEN_PROFILES;
 
@@ -189,6 +194,20 @@ bool guid_strings_equal(const godot::String &a, const godot::String &b) {
 	return a.to_lower() == b.to_lower();
 }
 
+bool dot11_ssid_equals(const DOT11_SSID &ssid, const godot::String &expected) {
+	if (expected.is_empty() || ssid.uSSIDLength == 0) {
+		return false;
+	}
+
+	const godot::CharString utf8 = expected.utf8();
+	const size_t expected_len = (size_t)utf8.length();
+	if (expected_len > DOT11_SSID_MAX_LENGTH || ssid.uSSIDLength != expected_len) {
+		return false;
+	}
+
+	return std::memcmp(ssid.ucSSID, utf8.get_data(), expected_len) == 0;
+}
+
 bool string_to_guid(const godot::String &text, GUID &guid) {
 	godot::String normalized = text.strip_edges();
 	if (normalized.begins_with("{")) {
@@ -261,6 +280,18 @@ godot::String sockaddr_to_ipv4_string(const SOCKET_ADDRESS &address) {
 	char ip_buffer[INET_ADDRSTRLEN] = {};
 	const auto *addr = reinterpret_cast<const sockaddr_in *>(address.lpSockaddr);
 	if (inet_ntop(AF_INET, &addr->sin_addr, ip_buffer, sizeof(ip_buffer)) == nullptr) {
+		return godot::String();
+	}
+	return godot::String(ip_buffer);
+}
+
+godot::String sockaddr_to_ipv6_string(const SOCKET_ADDRESS &address) {
+	if (address.lpSockaddr == nullptr || address.lpSockaddr->sa_family != AF_INET6) {
+		return godot::String();
+	}
+	char ip_buffer[INET6_ADDRSTRLEN] = {};
+	const auto *addr = reinterpret_cast<const sockaddr_in6 *>(address.lpSockaddr);
+	if (inet_ntop(AF_INET6, &addr->sin6_addr, ip_buffer, sizeof(ip_buffer)) == nullptr) {
 		return godot::String();
 	}
 	return godot::String(ip_buffer);
@@ -453,13 +484,19 @@ std::vector<IpAdapterSnapshot> query_ip_adapters() {
 			snapshot.has_network_guid = true;
 		}
 
+		godot::String ipv4_address;
+		godot::String ipv6_address;
 		for (PIP_ADAPTER_UNICAST_ADDRESS unicast = current->FirstUnicastAddress; unicast != nullptr; unicast = unicast->Next) {
-			godot::String ip = sockaddr_to_ipv4_string(unicast->Address);
-			if (!ip.is_empty()) {
-				snapshot.ip_address = ip;
-				break;
+			if (unicast->Address.lpSockaddr == nullptr) {
+				continue;
+			}
+			if (unicast->Address.lpSockaddr->sa_family == AF_INET && ipv4_address.is_empty()) {
+				ipv4_address = sockaddr_to_ipv4_string(unicast->Address);
+			} else if (unicast->Address.lpSockaddr->sa_family == AF_INET6 && ipv6_address.is_empty()) {
+				ipv6_address = sockaddr_to_ipv6_string(unicast->Address);
 			}
 		}
+		snapshot.ip_address = !ipv4_address.is_empty() ? ipv4_address : ipv6_address;
 
 		for (PIP_ADAPTER_GATEWAY_ADDRESS gateway = current->FirstGatewayAddress; gateway != nullptr; gateway = gateway->Next) {
 			godot::String ip = sockaddr_to_ipv4_string(gateway->Address);
@@ -491,6 +528,43 @@ const IpAdapterSnapshot *find_ip_adapter_for_guid(const std::vector<IpAdapterSna
 		}
 	}
 	return nullptr;
+}
+
+const IpAdapterSnapshot *find_ip_adapter_for_wlan(
+		const std::vector<IpAdapterSnapshot> &snapshots,
+		const GUID &iface_guid,
+		const godot::String &interface_description) {
+	if (const IpAdapterSnapshot *by_guid = find_ip_adapter_for_guid(snapshots, iface_guid)) {
+		return by_guid;
+	}
+
+	const godot::String desc_lower = interface_description.to_lower();
+	const IpAdapterSnapshot *description_match = nullptr;
+	const IpAdapterSnapshot *wifi_with_ip = nullptr;
+
+	for (const IpAdapterSnapshot &snapshot : snapshots) {
+		if (snapshot.if_type != IF_TYPE_IEEE80211) {
+			continue;
+		}
+
+		if (!snapshot.ip_address.is_empty() && snapshot.oper_status == IfOperStatusUp) {
+			wifi_with_ip = &snapshot;
+		}
+
+		if (!desc_lower.is_empty()) {
+			const godot::String snapshot_desc = snapshot.description.to_lower();
+			const godot::String snapshot_name = snapshot.friendly_name.to_lower();
+			if (snapshot_desc == desc_lower || snapshot_name == desc_lower ||
+					snapshot_desc.contains(desc_lower) || desc_lower.contains(snapshot_desc)) {
+				description_match = &snapshot;
+			}
+		}
+	}
+
+	if (description_match != nullptr) {
+		return description_match;
+	}
+	return wifi_with_ip;
 }
 
 bool resolve_interface_guid(
@@ -781,47 +855,97 @@ void append_connected_network(
 	WlanFreeMemory(attrs);
 }
 
+void collect_scan_results(
+		HANDLE handle,
+		const GUID &iface_guid,
+		const godot::String &iface_id,
+		std::map<godot::String, WifiNetwork> &deduped) {
+	PWLAN_AVAILABLE_NETWORK_LIST available = nullptr;
+	if (get_available_networks(handle, iface_guid, available)) {
+		collect_networks_from_list(handle, iface_guid, iface_id, available, deduped);
+		WlanFreeMemory(available);
+	}
+	collect_networks_from_bss_list(handle, iface_guid, iface_id, deduped);
+}
+
+bool is_connected_to_ssid(HANDLE handle, const GUID &iface_guid, const godot::String &ssid) {
+	PWLAN_CONNECTION_ATTRIBUTES attrs = nullptr;
+	DWORD attr_size = 0;
+	const DWORD result = WlanQueryInterface(
+			handle,
+			&iface_guid,
+			wlan_intf_opcode_current_connection,
+			nullptr,
+			&attr_size,
+			reinterpret_cast<PVOID *>(&attrs),
+			nullptr);
+	if (result != ERROR_SUCCESS || attrs == nullptr) {
+		return false;
+	}
+
+	const bool connected = attrs->isState == wlan_interface_state_connected;
+	const bool ssid_matches = dot11_ssid_equals(attrs->wlanAssociationAttributes.dot11Ssid, ssid);
+	WlanFreeMemory(attrs);
+	return connected && ssid_matches;
+}
+
+bool poll_connection_established(
+		HANDLE handle,
+		const GUID &iface_guid,
+		const godot::String &ssid,
+		DWORD timeout_ms) {
+	for (DWORD elapsed = 0; elapsed < timeout_ms; elapsed += kScanPollIntervalMs) {
+		if (is_connected_to_ssid(handle, iface_guid, ssid)) {
+			return true;
+		}
+		Sleep(kScanPollIntervalMs);
+	}
+	return is_connected_to_ssid(handle, iface_guid, ssid);
+}
+
 bool try_active_scan(
 		HANDLE handle,
 		const GUID &iface_guid,
 		const godot::String &iface_id,
 		std::map<godot::String, WifiNetwork> &deduped,
-		godot::String &scan_error) {
-	const size_t count_before = deduped.size();
+		godot::String &scan_error,
+		WlanNotificationWaiter *waiter) {
+	if (waiter != nullptr) {
+		waiter->begin_scan_wait(iface_guid);
+	}
+
 	const DWORD result = WlanScan(handle, &iface_guid, nullptr, nullptr, nullptr);
 	if (result != ERROR_SUCCESS) {
 		scan_error = format_scan_error(result);
 		return false;
 	}
 
-	for (DWORD attempt = 0; attempt < kScanPollAttempts; attempt++) {
-		Sleep(kScanPollIntervalMs);
-
-		PWLAN_AVAILABLE_NETWORK_LIST available = nullptr;
-		if (get_available_networks(handle, iface_guid, available)) {
-			collect_networks_from_list(handle, iface_guid, iface_id, available, deduped);
-			WlanFreeMemory(available);
-		}
-		collect_networks_from_bss_list(handle, iface_guid, iface_id, deduped);
-
-		if (deduped.size() > count_before || attempt >= 3) {
-			break;
-		}
+	if (waiter != nullptr) {
+		waiter->wait_for_scan_complete(kScanNotificationTimeoutMs);
+	} else {
+		Sleep(kScanPollIntervalMs * 3);
 	}
+
+	collect_scan_results(handle, iface_guid, iface_id, deduped);
 	return true;
 }
 
 } // namespace
 
 NetworkBackendWindows::NetworkBackendWindows() {
+	notification_waiter = std::make_unique<WlanNotificationWaiter>();
 	ensure_wlan_handle();
 }
 
 NetworkBackendWindows::~NetworkBackendWindows() {
 	if (wlan_handle != nullptr) {
+		if (notification_waiter) {
+			notification_waiter->unregister(static_cast<HANDLE>(wlan_handle));
+		}
 		WlanCloseHandle(static_cast<HANDLE>(wlan_handle), nullptr);
 		wlan_handle = nullptr;
 	}
+	notification_waiter.reset();
 }
 
 void NetworkBackendWindows::set_error(const godot::String &message) {
@@ -842,6 +966,9 @@ bool NetworkBackendWindows::ensure_wlan_handle() {
 	}
 
 	wlan_handle = handle;
+	if (notification_waiter) {
+		notification_waiter->ensure_registered(handle);
+	}
 	return true;
 }
 
@@ -969,7 +1096,8 @@ std::vector<WifiNetwork> NetworkBackendWindows::scan_wifi_networks(const godot::
 
 		if (deduped.empty()) {
 			godot::String scan_error;
-			if (!try_active_scan(handle, iface.InterfaceGuid, iface_id, deduped, scan_error) && !scan_error.is_empty()) {
+			WlanNotificationWaiter *waiter = notification_waiter.get();
+			if (!try_active_scan(handle, iface.InterfaceGuid, iface_id, deduped, scan_error, waiter) && !scan_error.is_empty()) {
 				last_scan_error = scan_error;
 			}
 		}
@@ -1063,14 +1191,52 @@ bool NetworkBackendWindows::connect_to_wifi(const godot::String &ssid, const god
 	params.dot11BssType = dot11_BSS_type_infrastructure;
 	params.dwFlags = 0;
 
+	if (notification_waiter) {
+		notification_waiter->begin_connect_wait(iface_guid, ssid);
+	}
+
 	result = WlanConnect(handle, &iface_guid, &params, nullptr);
 	if (result != ERROR_SUCCESS) {
 		set_error(report_win_failure("WlanConnect", result));
 		return false;
 	}
 
-	last_error = "";
-	return true;
+	if (notification_waiter) {
+		const WlanConnectWaitResult wait_result =
+				notification_waiter->wait_for_connect_complete(kConnectNotificationTimeoutMs);
+
+		if (wait_result.completed && wait_result.success) {
+			last_error = "";
+			return true;
+		}
+
+		if (poll_connection_established(handle, iface_guid, ssid, kConnectPollFallbackMs)) {
+			last_error = "";
+			return true;
+		}
+
+		if (wait_result.completed && !wait_result.success) {
+			const godot::String reason = wlan_reason_text(wait_result.reason_code);
+			log_windows_error_to_console("WlanConnect", 0, wait_result.reason_code);
+			if (reason.is_empty()) {
+				set_error("Could not connect to the network. The connection attempt failed.");
+			} else {
+				set_error("Could not connect to the network: " + reason);
+			}
+			return false;
+		}
+
+		set_error("Connection timed out. The network may be out of range or the password may be incorrect.");
+		return false;
+	}
+
+	if (poll_connection_established(handle, iface_guid, ssid, kConnectNotificationTimeoutMs)) {
+		last_error = "";
+		return true;
+	}
+
+	set_error("Connection timed out. The network may be out of range or the password may be incorrect.");
+	return false;
 }
 
 bool NetworkBackendWindows::disconnect_from_wifi(const godot::String &adapter_id) {
@@ -1147,7 +1313,9 @@ ConnectivityInfo NetworkBackendWindows::get_connectivity_info() {
 		WlanFreeMemory(attrs);
 	}
 
-	if (const IpAdapterSnapshot *ip_adapter = find_ip_adapter_for_guid(ip_adapters, active_iface->InterfaceGuid)) {
+	const godot::String iface_description = wide_to_utf8(active_iface->strInterfaceDescription);
+	if (const IpAdapterSnapshot *ip_adapter =
+				find_ip_adapter_for_wlan(ip_adapters, active_iface->InterfaceGuid, iface_description)) {
 		info.local_ip = ip_adapter->ip_address;
 		info.gateway = ip_adapter->gateway;
 		info.dns_primary = ip_adapter->dns_primary;
@@ -1177,7 +1345,9 @@ std::vector<NetworkAdapter> NetworkBackendWindows::get_network_adapters() {
 				adapter.is_up = iface.isState != wlan_interface_state_not_ready;
 				adapter.is_connected = iface.isState == wlan_interface_state_connected;
 
-				if (const IpAdapterSnapshot *ip_adapter = find_ip_adapter_for_guid(ip_adapters, iface.InterfaceGuid)) {
+				const godot::String iface_description = wide_to_utf8(iface.strInterfaceDescription);
+				if (const IpAdapterSnapshot *ip_adapter =
+							find_ip_adapter_for_wlan(ip_adapters, iface.InterfaceGuid, iface_description)) {
 					if (!ip_adapter->friendly_name.is_empty()) {
 						adapter.name = ip_adapter->friendly_name;
 					}

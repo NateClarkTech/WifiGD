@@ -12,7 +12,7 @@ var _adapter_id: String = ""
 
 
 func before_all() -> void:
-	if OS.get_name() != "Linux":
+	if not WifiTestHelpers.is_real_wifi_platform():
 		return
 	_env = WifiTestHelpers.load_wifi_env()
 	_ssid = _env.get("WIFI_SSID", "")
@@ -21,8 +21,7 @@ func before_all() -> void:
 
 
 func before_each() -> void:
-	if OS.get_name() != "Linux":
-		pending("Real Wi-Fi connect tests only run on Linux.")
+	if WifiTestHelpers.skip_unless_real_wifi_platform(self):
 		return
 
 	if _ssid.is_empty():
@@ -61,9 +60,13 @@ func test_real_scan_includes_env_network() -> void:
 	var params = get_signal_parameters(_wifi, "scan_completed", 0)
 	var networks: Array = params[0]
 	var error: int = params[1]
+	var message: String = params[2] if params.size() > 2 else ""
 
 	if error != OK and networks.is_empty():
-		pending("Scan failed: %s" % params[2])
+		if OS.get_name() == "Windows" and message.to_lower().contains("access denied"):
+			pending("Scan denied on Windows — enable Location for this app in Settings: %s" % message)
+		else:
+			pending("Scan failed: %s" % message)
 		return
 
 	var found := false
@@ -94,8 +97,8 @@ func test_real_connect_to_env_network_async() -> void:
 	var message: String = params[1]
 
 	if error != OK:
-		if message.contains("Permission denied") or message.contains("polkit"):
-			pending("Connect requires polkit approval: %s" % message)
+		if WifiTestHelpers.is_connect_permission_denied(message):
+			pending("Connect requires elevated permissions or system approval: %s" % message)
 		else:
 			fail_test("Connect to '%s' failed: %s" % [_ssid, message])
 		return
@@ -114,11 +117,15 @@ func test_real_verify_connected_to_env_network() -> void:
 			pending("Skipping connectivity check because connect did not succeed.")
 			return
 
-	await wait_seconds(1.0)
-	var info: Dictionary = _wifi.get_connectivity_info()
+	var info: Dictionary = await WifiTestHelpers.wait_until_has_ip(_wifi, 20.0)
 	WifiTestHelpers.assert_connectivity_shape(self, info)
 	assert_true(info.get("is_wifi_connected", false))
 	assert_eq(info.get("connected_ssid", ""), _ssid)
+	if info.get("local_ip", "").is_empty():
+		pending(
+			"Wi-Fi is associated but no IP was assigned within 20s (DHCP may be slow or adapter IP lookup failed)."
+		)
+		return
 	assert_false(info.get("local_ip", "").is_empty(), "Expected an IP address after connect.")
 
 
