@@ -134,16 +134,21 @@ git submodule update --init --recursive
 # Windows (PowerShell)
 scons platform=windows
 
-# Linux
+# Linux (local build — uses your host glibc)
 scons platform=linux
 
 # Release build
 scons platform=linux target=template_release
+
+# Linux (Docker — older glibc for distribution; recommended for published binaries)
+./build_linux_docker.sh --all-targets
 ```
 
 Binaries are written to `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`.
 
 Prebuilt GDExtension binaries are committed under `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`. Rebuild with `scons` when you change native code, then commit updated `.dll` / `.so` / `.dylib` files for your platforms.
+
+**Linux distribution builds:** Binaries compiled on a recent distro (e.g. openSUSE Tumbleweed, Ubuntu 24.04) link against a newer glibc and may fail to load on older systems. Use `./build_linux_docker.sh` to compile inside Ubuntu 20.04 (glibc 2.31) so the `.so` works on more Linux machines. The prebuilt Linux libraries in this repo are built that way.
 
 ### Run the demo
 
@@ -298,6 +303,27 @@ scons platform=macos
 ```
 
 Parallel builds: `scons platform=linux -j$(nproc)`
+
+### Linux: Docker build (older glibc)
+
+If you build on a modern Linux host, the resulting `.so` may require a glibc newer than what your users have (e.g. `GLIBC_2.43` on Tumbleweed vs `2.31` on Ubuntu 20.04). For add-ons you ship to others — including the binaries committed to this repository — build inside Ubuntu 20.04 via Docker:
+
+**Requirements:** [Docker](https://docs.docker.com/get-docker/) installed and running.
+
+```bash
+# Debug + release (typical for publishing)
+./build_linux_docker.sh --all-targets
+
+# Single target
+./build_linux_docker.sh target=template_release
+
+# Rebuild the container image after Dockerfile changes
+./build_linux_docker.sh --rebuild-image --all-targets
+```
+
+The script builds image `wifigd-builder:focal`, cleans stale object files, runs `scons platform=linux` in the container, and prints the GLIBC versions the binary needs. Override the image name with `WIFIGD_DOCKER_IMAGE` if needed.
+
+Use `--no-clean` to keep an existing godot-cpp cache between runs (faster, but only if the previous build was also from this container).
 
 ---
 
