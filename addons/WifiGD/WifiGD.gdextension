@@ -4,8 +4,6 @@ compatibility_minimum = "4.3"
 reloadable = true
 
 [libraries]
-macos.debug = "res://addons/WifiGD/bin/libwifigd.macos.template_debug.dylib"
-macos.release = "res://addons/WifiGD/bin/libwifigd.macos.template_release.dylib"
 windows.debug.x86_64 = "res://addons/WifiGD/bin/wifigd.windows.template_debug.x86_64.dll"
 windows.release.x86_64 = "res://addons/WifiGD/bin/wifigd.windows.template_release.x86_64.dll"
 linux.debug.x86_64 = "res://addons/WifiGD/bin/libwifigd.linux.template_debug.x86_64.so"
