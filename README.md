@@ -122,54 +122,14 @@ Not implemented — no permissions guidance yet.
 
 ---
 
-## Quick start
-
-### Clone and build
-
-```bash
-git clone <your-repo-url> WifiGD
-cd WifiGD
-git submodule update --init --recursive
-
-# Windows (PowerShell)
-scons platform=windows
-
-# Linux (local build — uses your host glibc)
-scons platform=linux
-
-# Release build
-scons platform=linux target=template_release
-
-# Linux (Docker — older glibc for distribution; recommended for published binaries)
-./build_linux_docker.sh --all-targets
-```
-
-Binaries are written to `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`.
-
-Prebuilt GDExtension binaries are committed under `addons/WifiGD/bin/` and mirrored to `demo/addons/WifiGD/bin/`. Rebuild with `scons` when you change native code, then commit updated `.dll` / `.so` / `.dylib` files for your platforms.
-
-**Linux distribution builds:** Binaries compiled on a recent distro (e.g. openSUSE Tumbleweed, Ubuntu 24.04) link against a newer glibc and may fail to load on older systems. Use `./build_linux_docker.sh` to compile inside Ubuntu 20.04 (glibc 2.31) so the `.so` works on more Linux machines. The prebuilt Linux libraries in this repo are built that way.
-
-### Run the demo
-
-```bash
-# From repo root — opens the demo project (not the editor by default on some setups)
-godot --path demo/
-```
-
-Or open `demo/project.godot` in the Godot editor.
-
-If you rebuild while Godot is open you may need to reload the project or close and reopen Godot to see changes.
-
----
 
 ## Installation in your project
 
-1. Copy `addons/WifiGD/` into your Godot project.
-2. Build the native library for your platform into `addons/WifiGD/bin/` (see [Building](#building)).
-3. Use `WifiManager` from GDScript (see [API](#api)).
+1. Install via the Godot Asset Library, or copy `addons/WifiGD/` into your Godot project.
+2. Prebuilt binaries are included under `addons/WifiGD/bin/`. Rebuild only if you change native code (see [Building](#building)).
+3. Use `WifiManager` from GDScript (see [API](#api)) — autoload `wifi_manager_autoload.tscn` (recommended), add a node, or use `example/wifi_demo.tscn`.
 
-No editor plugin is required — registration is via `WifiGD.gdextension`.
+No editor plugin — registration is via `WifiGD.gdextension`.
 
 ---
 
@@ -210,64 +170,6 @@ No editor plugin is required — registration is via `WifiGD.gdextension`.
 | `gateway` | `String` | Default gateway |
 | `dns_primary` | `String` | Primary DNS |
 
-### Example
-
-```gdscript
-extends Node
-
-func _ready() -> void:
-    WiFi.scan_completed.connect(_on_scan_completed)
-    WiFi.disconnect_completed.connect(_on_disconnect_completed)
-    WiFi.connectivity_changed.connect(_on_connectivity_changed)
-    WiFi.fetch_adapters_async()
-
-func _on_scan_completed(networks: Array, error: int, message: String) -> void:
-    if not message.is_empty():
-        print("Note: ", message)  # friendly UI text
-    for net in networks:
-        print(net["ssid"], " ", net["signal_strength"], "%")
-
-func disconnect() -> void:
-    WiFi.disconnect_from_wifi_async()
-
-func _on_connectivity_changed(info: Dictionary) -> void:
-    print("State: ", info.get("state"), " SSID: ", info.get("connected_ssid"))
-
-func _on_disconnect_completed(error: int, message: String) -> void:
-    if error == OK:
-        print("Disconnected")
-    else:
-        print("Failed: ", message)
-```
-
----
-
-## Project layout
-
-```
-WifiGD/
-├── addons/WifiGD/
-│   ├── WifiGD.gdextension      # GDExtension manifest
-│   └── bin/                    # Shipped .dll / .so / .dylib (tracked in git)
-├── demo/                       # Test UI project
-│   ├── project.godot
-│   ├── scenes/main.tscn
-│   └── scripts/main.gd
-├── godot-cpp/                  # Submodule (branch 4.3)
-├── src/
-│   ├── wifi_manager.{h,cpp}    # Public GDScript API, async tasks, signals
-│   ├── network_types.{h,cpp}   # WifiNetwork, NetworkAdapter, ConnectivityInfo
-│   ├── console_log.{h,cpp}     # Thread-safe log queue → Godot Output
-│   ├── register_types.cpp      # Class registration
-│   └── platform/
-│       ├── network_backend.h   # Abstract backend interface
-│       ├── network_backend.cpp # Platform factory
-│       ├── windows/network_backend_windows.cpp
-│       ├── linux/network_backend_linux.cpp
-│       └── macos/network_backend_macos.cpp
-├── SConstruct
-└── sync_addon.ps1              # Windows: copy DLL when demo is locked
-```
 
 ---
 
@@ -400,16 +302,8 @@ Live suite is **not** included in `demo/.gutconfig.json` (which only lists `unit
 
 ## Roadmap
 
-### Now
-
-- [x] Linux libnm backend: adapters, scan, connect, disconnect
-- [x] Linux `SConstruct` pkg-config wiring
-- [x] Polkit / permission error messages
-- [x] `Node` autoload wrapper scene
-
 ### Next
 
-- [x] Fix Windows connect end-to-end (association confirmation)
 - [ ] macOS CoreWLAN backend
 - [ ] Platform capability probe (`get_platform_capabilities()`)
 - [ ] Saved networks / forget profile
@@ -433,4 +327,4 @@ Live suite is **not** included in `demo/.gutconfig.json` (which only lists `unit
 
 ## License
 
-License not yet specified.
+MIT License — see [addons/WifiGD/LICENSE.md](addons/WifiGD/LICENSE.md).

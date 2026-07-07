@@ -19,7 +19,7 @@ foreach ($subpath in @("", "bin")) {
 }
 
 Copy-Item (Join-Path $source "WifiGD.gdextension") (Join-Path $target "WifiGD.gdextension") -Force
-Copy-Item (Join-Path $source "plugin.cfg") (Join-Path $target "plugin.cfg") -Force -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $source "wifi_manager_autoload.tscn") (Join-Path $target "wifi_manager_autoload.tscn") -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $source "bin\*") (Join-Path $target "bin\") -Force
 
 Write-Host "Synced WifiGD addon to demo/addons/WifiGD"
