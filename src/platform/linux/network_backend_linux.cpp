@@ -16,6 +16,7 @@ namespace {
 
 constexpr int kScanTimeoutSec = 15;
 constexpr int kConnectTimeoutSec = 30;
+constexpr int kRadioSetTimeoutSec = 30;
 constexpr int kConnectPollIntervalMs = 200;
 constexpr const char *kWifiGdConnectionId = "WifiGD Connection";
 
@@ -158,6 +159,55 @@ struct AsyncWaitContext {
 	bool success = false;
 	NMActiveConnection *active = nullptr;
 };
+
+bool get_effective_wifi_enabled(NMClient *client) {
+	if (client == nullptr) {
+		return false;
+	}
+	return nm_client_wireless_get_enabled(client) != FALSE &&
+			nm_client_wireless_hardware_get_enabled(client) != FALSE;
+}
+
+godot::String permission_result_to_string(NMClientPermissionResult result) {
+	switch (result) {
+		case NM_CLIENT_PERMISSION_RESULT_YES:
+			return "yes";
+		case NM_CLIENT_PERMISSION_RESULT_AUTH:
+			return "auth";
+		case NM_CLIENT_PERMISSION_RESULT_NO:
+			return "no";
+		default:
+			return "unknown";
+	}
+}
+
+WifiRadioState read_wifi_radio_state(NMClient *client) {
+	WifiRadioState state;
+	if (client == nullptr) {
+		return state;
+	}
+
+	state.software_enabled = nm_client_wireless_get_enabled(client) != FALSE;
+	state.hardware_enabled = nm_client_wireless_hardware_get_enabled(client) != FALSE;
+	state.enabled = state.software_enabled && state.hardware_enabled;
+
+	const NMClientPermissionResult permission =
+			nm_client_get_permission_result(client, NM_CLIENT_PERMISSION_ENABLE_DISABLE_WIFI);
+	state.permission = permission_result_to_string(permission);
+	state.can_toggle = permission == NM_CLIENT_PERMISSION_RESULT_YES ||
+			permission == NM_CLIENT_PERMISSION_RESULT_AUTH;
+	return state;
+}
+
+bool radio_reached_requested_state(NMClient *client, bool enabled) {
+	if (client == nullptr) {
+		return false;
+	}
+	if (enabled) {
+		return get_effective_wifi_enabled(client);
+	}
+	return nm_client_wireless_get_enabled(client) == FALSE;
+}
 
 // libnm async D-Bus calls must run on a thread with an acquired GMainContext.
 struct NmThreadSession {
@@ -391,6 +441,83 @@ bool run_main_loop_until(GMainContext *context, GMainLoop *loop, int timeout_sec
 		}
 	}
 	return true;
+}
+
+bool wait_for_wifi_radio_state(
+		GMainContext *context,
+		NMClient *client,
+		bool enabled,
+		int timeout_sec) {
+	const gint64 deadline = g_get_monotonic_time() + (gint64)timeout_sec * G_TIME_SPAN_SECOND;
+	while (g_get_monotonic_time() < deadline) {
+		pump_main_context(context);
+
+		if (enabled) {
+			if (get_effective_wifi_enabled(client)) {
+				return true;
+			}
+		} else if (nm_client_wireless_get_enabled(client) == FALSE) {
+			return true;
+		}
+
+		g_usleep((gulong)kConnectPollIntervalMs * 1000);
+	}
+
+	pump_main_context(context);
+	if (enabled) {
+		return get_effective_wifi_enabled(client);
+	}
+	return nm_client_wireless_get_enabled(client) == FALSE;
+}
+
+bool set_wifi_enabled_on(NMClient *client, GMainContext *context, bool enabled, godot::String &error_out) {
+	if (client == nullptr || context == nullptr) {
+		error_out = "NetworkManager is not available.";
+		return false;
+	}
+
+	if (enabled && nm_client_wireless_hardware_get_enabled(client) == FALSE) {
+		error_out = "Wi-Fi is blocked by hardware rfkill (check physical switch or BIOS).";
+		return false;
+	}
+
+	if (enabled && nm_client_networking_get_enabled(client) == FALSE) {
+		error_out = "Networking is disabled. Enable networking before turning on Wi-Fi.";
+		return false;
+	}
+
+	const NMClientPermissionResult permission =
+			nm_client_get_permission_result(client, NM_CLIENT_PERMISSION_ENABLE_DISABLE_WIFI);
+	if (permission == NM_CLIENT_PERMISSION_RESULT_NO) {
+		error_out = "Permission denied by system policy for Wi-Fi radio control.";
+		return false;
+	}
+
+	if (radio_reached_requested_state(client, enabled)) {
+		error_out = "";
+		return true;
+	}
+
+	// Deprecated sync setter; requires pumping the session GMainContext to complete the
+	// D-Bus write. nm_client_dbus_set_property_finish() can report failure as root even
+	// when NM applies the change, so we always verify the resulting radio state.
+	nm_client_wireless_set_enabled(client, enabled ? TRUE : FALSE);
+
+	if (wait_for_wifi_radio_state(context, client, enabled, kRadioSetTimeoutSec)) {
+		error_out = "";
+		return true;
+	}
+
+	pump_main_context(context);
+	if (radio_reached_requested_state(client, enabled)) {
+		error_out = "";
+		return true;
+	}
+
+	error_out = enabled
+			? "Wi-Fi radio did not turn on in time. Approve the system dialog or check rfkill."
+			: "Wi-Fi radio did not turn off in time.";
+	return false;
 }
 
 NMDeviceWifi *resolve_wifi_device_on(NMClient *nm_client, const godot::String &adapter_id, godot::String &error_out) {
@@ -689,30 +816,51 @@ NMDeviceWifi *NetworkBackendLinux::resolve_wifi_device(const godot::String &adap
 }
 
 bool NetworkBackendLinux::is_wifi_enabled() {
-	if (!ensure_nm_available()) {
-		return false;
+	// Radio toggles run on a dedicated NmThreadSession; read state the same way so
+	// we don't return a stale wireless-enabled value from the long-lived client.
+	NmThreadSession session;
+	if (!session.is_ready()) {
+		if (!ensure_nm_available()) {
+			return false;
+		}
+		last_error = "";
+		return get_effective_wifi_enabled(client);
 	}
+	pump_main_context(session.context);
 	last_error = "";
-	return nm_client_wireless_get_enabled(client) != FALSE;
+	return get_effective_wifi_enabled(session.client);
 }
 
 bool NetworkBackendLinux::set_wifi_enabled(bool enabled) {
-	if (!ensure_nm_available()) {
+	NmThreadSession session;
+	if (!session.is_ready()) {
+		log_gerror("NetworkManager init", session.init_error);
+		set_error("NetworkManager is not available.");
 		return false;
 	}
 
-	nm_client_wireless_set_enabled(client, enabled ? TRUE : FALSE);
-
-	for (int attempt = 0; attempt < 10; attempt++) {
-		if (nm_client_wireless_get_enabled(client) == (enabled ? TRUE : FALSE)) {
-			last_error = "";
-			return true;
-		}
-		g_usleep(100 * 1000);
+	godot::String error;
+	if (!set_wifi_enabled_on(session.client, session.context, enabled, error)) {
+		set_error(error);
+		return false;
 	}
 
-	set_error("Permission denied. Approve the system dialog or configure polkit for your user.");
-	return false;
+	last_error = "";
+	return true;
+}
+
+WifiRadioState NetworkBackendLinux::get_wifi_radio_state() {
+	NmThreadSession session;
+	if (!session.is_ready()) {
+		if (!ensure_nm_available()) {
+			return WifiRadioState();
+		}
+		last_error = "";
+		return read_wifi_radio_state(client);
+	}
+	pump_main_context(session.context);
+	last_error = "";
+	return read_wifi_radio_state(session.client);
 }
 
 std::vector<NetworkAdapter> NetworkBackendLinux::get_network_adapters() {

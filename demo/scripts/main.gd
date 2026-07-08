@@ -34,6 +34,8 @@ func _ready() -> void:
 		WiFi.disconnect_completed.connect(_on_disconnect_completed)
 		WiFi.adapters_updated.connect(_on_adapters_updated)
 		WiFi.connectivity_changed.connect(_on_connectivity_changed)
+		if WiFi.has_signal("wifi_radio_set_completed"):
+			WiFi.wifi_radio_set_completed.connect(_on_wifi_radio_set_completed)
 	else:
 		_log_message("ERROR: Outdated WifiGD library loaded in demo/addons/WifiGD/bin.")
 		_log_message("Close Godot, rebuild with: scons platform=linux")
@@ -225,6 +227,19 @@ func _on_disconnect_completed(error: int, message: String) -> void:
 	_refresh_connectivity()
 
 
+func _on_wifi_radio_set_completed(error: int, message: String) -> void:
+	_set_busy(false)
+	if error != OK:
+		if message.is_empty():
+			message = WiFi.get_last_error()
+		_log_message("ERROR: Wi-Fi radio change failed: %s" % message)
+	else:
+		_log_message(
+			"OK: Wi-Fi radio is now %s." % ("enabled" if WiFi.is_wifi_enabled() else "disabled")
+		)
+	_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
+
+
 func _refresh_adapters() -> void:
 	if _busy:
 		return
@@ -337,12 +352,30 @@ func _on_wifi_radio_toggled(enabled: bool) -> void:
 	_set_busy(true)
 	_log_message("Setting Wi-Fi radio to %s..." % ("on" if enabled else "off"))
 
-	if not WiFi.set_wifi_enabled(enabled):
-		_log_message("ERROR: Wi-Fi radio change failed: %s" % WiFi.get_last_error())
+	if _uses_async_api and WiFi.has_method("set_wifi_enabled_async"):
+		WiFi.set_wifi_enabled_async(enabled)
+		if WiFi.has_signal("wifi_radio_set_completed"):
+			await WiFi.wifi_radio_set_completed
+		else:
+			await get_tree().process_frame
+			if not WiFi.set_wifi_enabled(enabled):
+				_log_message("ERROR: Wi-Fi radio change failed: %s" % WiFi.get_last_error())
+			else:
+				_log_message(
+					"OK: Wi-Fi radio is now %s." % ("enabled" if WiFi.is_wifi_enabled() else "disabled")
+				)
+			_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
+			_set_busy(false)
 	else:
-		_log_message("OK: Wi-Fi radio is now %s." % ("enabled" if WiFi.is_wifi_enabled() else "disabled"))
-	_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
-	_set_busy(false)
+		await get_tree().process_frame
+		if not WiFi.set_wifi_enabled(enabled):
+			_log_message("ERROR: Wi-Fi radio change failed: %s" % WiFi.get_last_error())
+		else:
+			_log_message(
+				"OK: Wi-Fi radio is now %s." % ("enabled" if WiFi.is_wifi_enabled() else "disabled")
+			)
+		_wifi_radio.set_pressed_no_signal(WiFi.is_wifi_enabled())
+		_set_busy(false)
 
 
 func _on_copy_log_pressed() -> void:

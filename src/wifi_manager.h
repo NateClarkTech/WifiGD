@@ -23,6 +23,7 @@ private:
 	bool connect_in_progress = false;
 	bool disconnect_in_progress = false;
 	bool adapters_in_progress = false;
+	bool radio_set_in_progress = false;
 
 	Array pending_networks;
 	Error pending_error = OK;
@@ -40,11 +41,13 @@ private:
 	static void _connect_native_task(void *p_userdata);
 	static void _disconnect_native_task(void *p_userdata);
 	static void _adapters_native_task(void *p_userdata);
+	static void _radio_set_native_task(void *p_userdata);
 
 	void _emit_scan_completed();
 	void _emit_connect_completed();
 	void _emit_disconnect_completed();
 	void _emit_adapters_updated();
+	void _emit_wifi_radio_set_completed();
 	void _flush_console_logs() const;
 	void _poll_connectivity();
 	void _update_cached_connectivity(const Dictionary &info);
@@ -62,6 +65,8 @@ public:
 
 	bool is_wifi_enabled() const;
 	bool set_wifi_enabled(bool enabled);
+	void set_wifi_enabled_async(bool enabled);
+	Dictionary get_wifi_radio_state() const;
 
 	Array scan_wifi_networks(const String &adapter_id = "") const;
 	void scan_wifi_networks_async(const String &adapter_id = "");

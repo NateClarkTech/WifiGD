@@ -64,6 +64,16 @@ struct ConnectivityInfo {
 	godot::Dictionary to_dict() const;
 };
 
+struct WifiRadioState {
+	bool enabled = false;
+	bool software_enabled = false;
+	bool hardware_enabled = false;
+	bool can_toggle = false;
+	godot::String permission; // "yes", "auth", "no", "unknown"
+
+	godot::Dictionary to_dict() const;
+};
+
 godot::String adapter_type_to_string(AdapterType type);
 godot::String connection_state_to_string(ConnectionState state);
 

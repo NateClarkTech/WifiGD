@@ -1039,6 +1039,40 @@ bool NetworkBackendWindows::set_wifi_enabled(bool enabled) {
 	return success;
 }
 
+WifiRadioState NetworkBackendWindows::get_wifi_radio_state() {
+	WifiRadioState state;
+	if (!ensure_wlan_handle()) {
+		return state;
+	}
+
+	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
+	const DWORD result = WlanEnumInterfaces(static_cast<HANDLE>(wlan_handle), nullptr, &interfaces);
+	if (result != ERROR_SUCCESS || interfaces == nullptr || interfaces->dwNumberOfItems == 0) {
+		if (interfaces != nullptr) {
+			WlanFreeMemory(interfaces);
+		}
+		return state;
+	}
+
+	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
+		const GUID &iface_guid = interfaces->InterfaceInfo[i].InterfaceGuid;
+		bool radio_enabled = false;
+		godot::String error_message;
+		if (query_radio_enabled(static_cast<HANDLE>(wlan_handle), iface_guid, radio_enabled, error_message) && radio_enabled) {
+			state.enabled = true;
+			state.software_enabled = true;
+			state.hardware_enabled = true;
+			break;
+		}
+	}
+
+	WlanFreeMemory(interfaces);
+	state.permission = "unknown";
+	state.can_toggle = true;
+	last_error = "";
+	return state;
+}
+
 std::vector<WifiNetwork> NetworkBackendWindows::scan_wifi_networks(const godot::String &adapter_id) {
 	std::vector<WifiNetwork> networks;
 	if (!ensure_wlan_handle()) {

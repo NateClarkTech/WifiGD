@@ -42,6 +42,18 @@ bool NetworkBackendMock::set_wifi_enabled(bool enabled) {
 	return true;
 }
 
+WifiRadioState NetworkBackendMock::get_wifi_radio_state() {
+	last_error = "";
+
+	WifiRadioState state;
+	state.software_enabled = wifi_enabled;
+	state.hardware_enabled = true;
+	state.enabled = wifi_enabled;
+	state.permission = "yes";
+	state.can_toggle = true;
+	return state;
+}
+
 std::vector<WifiNetwork> NetworkBackendMock::scan_wifi_networks(const godot::String &adapter_id) {
 	(void)adapter_id;
 	scan_call_count++;

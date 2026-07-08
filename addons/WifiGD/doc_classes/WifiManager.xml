@@ -43,6 +43,15 @@
 		dns_primary       — Primary DNS
 		has_internet      — Best-effort reachability hint
 		[/codeblock]
+		[b]WifiRadioState dictionary[/b] (from [method get_wifi_radio_state]):
+		[codeblock lang=text]
+		enabled           — Effective radio on (matches [method is_wifi_enabled])
+		software_enabled  — OS/software Wi-Fi toggle (NM WirelessEnabled on Linux)
+		hardware_enabled  — Hardware rfkill not blocking (NM WirelessHardwareEnabled on Linux)
+		can_toggle        — true when permission is yes or auth
+		permission        — Linux polkit hint: yes, auth, no, or unknown
+		[/codeblock]
+		[b]Wi-Fi radio:[/b] Prefer [method set_wifi_enabled_async] and [signal wifi_radio_set_completed] during gameplay. Call [method get_wifi_radio_state] before showing a toggle — disable the control when [code]can_toggle[/code] is [code]false[/code]. On Linux, polkit may require authorization; Godot does not display polkit dialogs, so failures with permission-denied messages are common without a desktop polkit agent or passwordless rules.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -50,7 +59,7 @@
 		<method name="is_wifi_enabled">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] if the Wi-Fi radio appears enabled.
+				Returns [code]true[/code] if the Wi-Fi radio is effectively on. On Linux this is the software toggle [b]and[/b] hardware not rfkill-blocked (same as [code]enabled[/code] in [method get_wifi_radio_state]). Updated by internal polling and after successful radio changes.
 			</description>
 		</method>
 		<method name="set_wifi_enabled">
@@ -59,7 +68,22 @@
 				Desired radio state.
 			</param>
 			<description>
-				Enables or disables the Wi-Fi radio. May require elevated privileges or polkit approval on Linux. Returns [code]false[/code] on failure; see [method get_last_error].
+				[b]Synchronous.[/b] Enables or disables the Wi-Fi radio and blocks until the OS request completes (up to ~30s on Linux). May require administrator privileges on Windows or polkit / elevation on Linux. Returns [code]false[/code] on failure; see [method get_last_error]. Does not emit [signal wifi_radio_set_completed] — use [method set_wifi_enabled_async] for signal-based UI. On success, [signal wifi_enabled_changed] is emitted when polling detects the new state.
+			</description>
+		</method>
+		<method name="set_wifi_enabled_async">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool">
+				Desired radio state.
+			</param>
+			<description>
+				Starts an asynchronous Wi-Fi radio enable/disable on a worker thread. Result arrives via [signal wifi_radio_set_completed]. Only one radio operation runs at a time; a second call while busy emits [signal wifi_radio_set_completed] with [code]ERR_BUSY[/code]. On Linux, requires NetworkManager and polkit permission [code]enable-disable-wifi[/code]; Godot cannot show polkit authorization dialogs — configure policy or run elevated if toggles fail without a desktop polkit agent.
+			</description>
+		</method>
+		<method name="get_wifi_radio_state">
+			<return type="Dictionary" />
+			<description>
+				Returns a [b]WifiRadioState[/b] dictionary (see class description): [code]enabled[/code], [code]software_enabled[/code], [code]hardware_enabled[/code], [code]can_toggle[/code], and [code]permission[/code] ([code]yes[/code], [code]auth[/code], [code]no[/code], or [code]unknown[/code]). Use to decide whether to show or disable a Wi-Fi radio switch before calling [method set_wifi_enabled_async].
 			</description>
 		</method>
 		<method name="scan_wifi_networks">
@@ -245,10 +269,21 @@
 		</signal>
 		<signal name="wifi_enabled_changed">
 			<param index="0" name="enabled" type="bool">
-				New radio enabled state.
+				New effective radio enabled state.
 			</param>
 			<description>
-				Emitted when the Wi-Fi radio enabled state changes.
+				Emitted when the effective Wi-Fi radio state changes (polled automatically ~every 2 seconds while the node is in the tree, and after a successful async toggle). Matches [method is_wifi_enabled] / [code]enabled[/code] in [method get_wifi_radio_state].
+			</description>
+		</signal>
+		<signal name="wifi_radio_set_completed">
+			<param index="0" name="error" type="int">
+				Godot [enum Error] code ([code]OK[/code] on success, [code]ERR_CANT_CONNECT[/code] on OS failure, [code]ERR_BUSY[/code] if another radio change is in progress).
+			</param>
+			<param index="1" name="message" type="String">
+				Friendly status or error text for UI logs.
+			</param>
+			<description>
+				Emitted when [method set_wifi_enabled_async] finishes. Check [code]error == OK[/code] before syncing UI; on failure [code]message[/code] often indicates polkit denial, rfkill, or timeout. Does not fire for [method set_wifi_enabled] (sync).
 			</description>
 		</signal>
 	</signals>

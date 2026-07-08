@@ -21,6 +21,13 @@ bool NetworkBackendMacOS::set_wifi_enabled(bool enabled) {
 	return false;
 }
 
+WifiRadioState NetworkBackendMacOS::get_wifi_radio_state() {
+	WifiRadioState state;
+	state.permission = "no";
+	state.can_toggle = false;
+	return state;
+}
+
 std::vector<WifiNetwork> NetworkBackendMacOS::scan_wifi_networks(const godot::String &adapter_id) {
 	set_error("macOS Wi-Fi scan is not yet implemented. Planned: CWInterface scanForNetworksWithName.");
 	(void)adapter_id;

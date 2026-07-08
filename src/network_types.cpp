@@ -74,4 +74,14 @@ godot::Dictionary ConnectivityInfo::to_dict() const {
 	return dict;
 }
 
+godot::Dictionary WifiRadioState::to_dict() const {
+	godot::Dictionary dict;
+	dict[godot::Variant("enabled")] = enabled;
+	dict[godot::Variant("software_enabled")] = software_enabled;
+	dict[godot::Variant("hardware_enabled")] = hardware_enabled;
+	dict[godot::Variant("can_toggle")] = can_toggle;
+	dict[godot::Variant("permission")] = permission;
+	return dict;
+}
+
 } // namespace wifigd

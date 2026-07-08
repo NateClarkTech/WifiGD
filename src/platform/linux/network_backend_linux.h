@@ -25,6 +25,7 @@ public:
 
 	bool is_wifi_enabled() override;
 	bool set_wifi_enabled(bool enabled) override;
+	WifiRadioState get_wifi_radio_state() override;
 
 	std::vector<WifiNetwork> scan_wifi_networks(const godot::String &adapter_id) override;
 	bool connect_to_wifi(const godot::String &ssid, const godot::String &password, const godot::String &adapter_id) override;

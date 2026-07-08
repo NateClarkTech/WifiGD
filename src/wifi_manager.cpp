@@ -33,6 +33,11 @@ struct AdaptersTaskData {
 	WifiManager *manager = nullptr;
 };
 
+struct RadioSetTaskData {
+	WifiManager *manager = nullptr;
+	bool enabled = false;
+};
+
 Array networks_to_array(const std::vector<wifigd::WifiNetwork> &networks) {
 	Array result;
 	result.resize((int)networks.size());
@@ -93,6 +98,8 @@ void WifiManager::_process(double delta) {
 void WifiManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_wifi_enabled"), &WifiManager::is_wifi_enabled);
 	ClassDB::bind_method(D_METHOD("set_wifi_enabled", "enabled"), &WifiManager::set_wifi_enabled);
+	ClassDB::bind_method(D_METHOD("set_wifi_enabled_async", "enabled"), &WifiManager::set_wifi_enabled_async);
+	ClassDB::bind_method(D_METHOD("get_wifi_radio_state"), &WifiManager::get_wifi_radio_state);
 
 	ClassDB::bind_method(D_METHOD("scan_wifi_networks", "adapter_id"), &WifiManager::scan_wifi_networks, DEFVAL(""));
 	ClassDB::bind_method(D_METHOD("scan_wifi_networks_async", "adapter_id"), &WifiManager::scan_wifi_networks_async, DEFVAL(""));
@@ -116,6 +123,7 @@ void WifiManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_emit_connect_completed"), &WifiManager::_emit_connect_completed);
 	ClassDB::bind_method(D_METHOD("_emit_disconnect_completed"), &WifiManager::_emit_disconnect_completed);
 	ClassDB::bind_method(D_METHOD("_emit_adapters_updated"), &WifiManager::_emit_adapters_updated);
+	ClassDB::bind_method(D_METHOD("_emit_wifi_radio_set_completed"), &WifiManager::_emit_wifi_radio_set_completed);
 
 	ADD_SIGNAL(MethodInfo("scan_completed", PropertyInfo(Variant::ARRAY, "networks"), PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
 	ADD_SIGNAL(MethodInfo("connect_completed", PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
@@ -124,6 +132,7 @@ void WifiManager::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("connectivity_changed", PropertyInfo(Variant::DICTIONARY, "info")));
 	ADD_SIGNAL(MethodInfo("connection_state_changed", PropertyInfo(Variant::INT, "state"), PropertyInfo(Variant::STRING, "ssid")));
 	ADD_SIGNAL(MethodInfo("wifi_enabled_changed", PropertyInfo(Variant::BOOL, "enabled")));
+	ADD_SIGNAL(MethodInfo("wifi_radio_set_completed", PropertyInfo(Variant::INT, "error"), PropertyInfo(Variant::STRING, "message")));
 
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::DISCONNECTED));
 	BIND_CONSTANT(static_cast<int>(wifigd::ConnectionState::CONNECTING));
@@ -173,11 +182,64 @@ bool WifiManager::set_wifi_enabled(bool enabled) {
 		result = backend ? backend->set_wifi_enabled(enabled) : false;
 	}
 	_flush_console_logs();
-	if (result) {
-		last_wifi_enabled = enabled;
-		emit_signal("wifi_enabled_changed", enabled);
-	}
+	_poll_connectivity();
 	return result;
+}
+
+void WifiManager::set_wifi_enabled_async(bool enabled) {
+	if (radio_set_in_progress) {
+		emit_signal("wifi_radio_set_completed", ERR_BUSY, "A Wi-Fi radio change is already in progress.");
+		return;
+	}
+
+	radio_set_in_progress = true;
+	RadioSetTaskData *task = new RadioSetTaskData();
+	task->manager = this;
+	task->enabled = enabled;
+	WorkerThreadPool::get_singleton()->add_native_task(_radio_set_native_task, task, true, "WifiGD radio set");
+}
+
+void WifiManager::_radio_set_native_task(void *p_userdata) {
+	RadioSetTaskData *task = static_cast<RadioSetTaskData *>(p_userdata);
+	WifiManager *manager = task->manager;
+	const bool enabled = task->enabled;
+	delete task;
+
+	Error error = OK;
+	String message;
+
+	{
+		std::lock_guard<std::mutex> lock(manager->backend_mutex);
+		if (!manager->backend) {
+			error = ERR_UNAVAILABLE;
+			message = "Network backend unavailable.";
+		} else if (!manager->backend->set_wifi_enabled(enabled)) {
+			error = ERR_CANT_CONNECT;
+			message = manager->backend->get_last_error();
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(manager->backend_mutex);
+		manager->pending_error = error;
+		manager->pending_message = message;
+	}
+	manager->call_deferred("_emit_wifi_radio_set_completed");
+}
+
+void WifiManager::_emit_wifi_radio_set_completed() {
+	_flush_console_logs();
+	radio_set_in_progress = false;
+	emit_signal("wifi_radio_set_completed", pending_error, pending_message);
+	_poll_connectivity();
+}
+
+Dictionary WifiManager::get_wifi_radio_state() const {
+	std::lock_guard<std::mutex> lock(backend_mutex);
+	if (!backend) {
+		return Dictionary();
+	}
+	return backend->get_wifi_radio_state().to_dict();
 }
 
 Array WifiManager::scan_wifi_networks(const String &adapter_id) const {

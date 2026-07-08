@@ -77,6 +77,43 @@ func test_set_wifi_enabled_mock() -> void:
 	assert_true(_wifi.is_wifi_enabled())
 
 
+func test_get_wifi_radio_state_mock() -> void:
+	var state: Dictionary = _wifi.get_wifi_radio_state()
+	WifiTestHelpers.assert_wifi_radio_shape(self, state)
+	assert_true(state.get("enabled", false))
+	assert_true(state.get("software_enabled", false))
+	assert_true(state.get("hardware_enabled", false))
+	assert_true(state.get("can_toggle", false))
+	assert_eq(state.get("permission"), "yes")
+
+
+func test_set_wifi_enabled_async_emits_completed() -> void:
+	watch_signals(_wifi)
+	_wifi.set_wifi_enabled_async(false)
+	await wait_seconds(0.5)
+
+	assert_signal_emitted(_wifi, "wifi_radio_set_completed")
+	var params = get_signal_parameters(_wifi, "wifi_radio_set_completed", 0)
+	assert_not_null(params)
+	assert_eq(params[0], OK)
+	assert_false(_wifi.is_wifi_enabled())
+
+
+func test_radio_busy_guard() -> void:
+	watch_signals(_wifi)
+	_wifi.set_wifi_enabled_async(false)
+	_wifi.set_wifi_enabled_async(true)
+	await wait_seconds(0.5)
+
+	var busy_calls := 0
+	for i in range(get_signal_emit_count(_wifi, "wifi_radio_set_completed")):
+		var params = get_signal_parameters(_wifi, "wifi_radio_set_completed", i)
+		if params[0] == ERR_BUSY:
+			busy_calls += 1
+
+	assert_eq(busy_calls, 1)
+
+
 func test_scan_wifi_networks_sync() -> void:
 	var networks: Array = _wifi.scan_wifi_networks("wlan0")
 	assert_eq(networks.size(), 3)

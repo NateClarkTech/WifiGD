@@ -1,6 +1,6 @@
 # WifiGD
 
-Cross-platform Wi-Fi scan, connect, and connectivity management for Godot 4.3+.
+Cross-platform Wi-Fi scan, connect, disconnect, radio toggle, and connectivity management for Godot 4.3+.
 
 ## Install
 
@@ -15,7 +15,7 @@ Cross-platform Wi-Fi scan, connect, and connectivity management for Godot 4.3+.
 ## Supported platforms
 
 - **Windows 10/11** (x86_64) — supported (WLAN API; Location services required for scan)
-- **Linux** (x86_64) — supported (NetworkManager / libnm; polkit may prompt for connect/radio)
+- **Linux** (x86_64) — supported (NetworkManager / libnm; polkit for connect/radio — use `get_wifi_radio_state()` and `set_wifi_enabled_async()`; Godot does not show polkit dialogs)
 - **macOS** — not implemented yet
 
 ## License

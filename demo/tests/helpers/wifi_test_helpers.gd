@@ -66,7 +66,8 @@ static func await_signal(signal_obj: Object, signal_name: StringName, timeout_se
 	signal_obj.connect(signal_name, callable)
 	var elapsed := 0.0
 	while not emitted[0] and elapsed < timeout_sec:
-		await Engine.get_main_loop().process_frame
+		# call_deferred completions (e.g. wifi_radio_set_completed) run on idle.
+		await Engine.get_main_loop().idle_frame
 		elapsed += Engine.get_main_loop().root.get_process_delta_time()
 
 	if not emitted[0]:
@@ -101,6 +102,34 @@ static func assert_connectivity_shape(gut, info: Dictionary) -> void:
 	]
 	for key in required:
 		gut.assert_true(info.has(key), "ConnectivityInfo missing key: %s" % key)
+
+
+static func assert_wifi_radio_shape(gut, state: Dictionary) -> void:
+	var required := [
+		"enabled", "software_enabled", "hardware_enabled", "can_toggle", "permission",
+	]
+	for key in required:
+		gut.assert_true(state.has(key), "WifiRadioState missing key: %s" % key)
+
+
+static func is_radio_permission_denied(message: String) -> bool:
+	var lower := message.to_lower()
+	if OS.get_name() == "Linux":
+		return lower.contains("permission denied") or lower.contains("polkit")
+	if OS.get_name() == "Windows":
+		return (
+			lower.contains("access denied")
+			or lower.contains("administrator")
+			or lower.contains("elevation")
+		)
+	return false
+
+
+static func is_radio_hardware_blocked(state: Dictionary, message: String = "") -> bool:
+	if not state.get("hardware_enabled", true):
+		return true
+	var lower := message.to_lower()
+	return lower.contains("rfkill") or lower.contains("hardware")
 
 
 static func load_wifi_env() -> Dictionary:

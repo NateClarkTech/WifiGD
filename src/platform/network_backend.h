@@ -15,6 +15,7 @@ public:
 
 	virtual bool is_wifi_enabled() = 0;
 	virtual bool set_wifi_enabled(bool enabled) = 0;
+	virtual WifiRadioState get_wifi_radio_state() = 0;
 
 	virtual std::vector<WifiNetwork> scan_wifi_networks(const godot::String &adapter_id) = 0;
 	virtual bool connect_to_wifi(const godot::String &ssid, const godot::String &password, const godot::String &adapter_id) = 0;

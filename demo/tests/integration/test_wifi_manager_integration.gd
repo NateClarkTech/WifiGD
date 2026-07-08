@@ -45,6 +45,12 @@ func test_real_is_wifi_enabled_reflects_radio_state() -> void:
 	assert_true(enabled == true or enabled == false)
 
 
+func test_real_get_wifi_radio_state_shape() -> void:
+	var state: Dictionary = _wifi.get_wifi_radio_state()
+	WifiTestHelpers.assert_wifi_radio_shape(self, state)
+	assert_eq(state.get("enabled", null), _wifi.is_wifi_enabled())
+
+
 func test_real_scan_wifi_networks_async() -> void:
 	if not _wifi.is_wifi_enabled():
 		pending("Wi-Fi radio is disabled on this machine.")

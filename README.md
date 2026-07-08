@@ -17,14 +17,41 @@ Cross-platform Wi-Fi management for Godot 4 via GDExtension. Enumerate adapters,
 
 func _ready() -> void:
     WiFi.scan_completed.connect(_on_scan_done)
+    WiFi.wifi_radio_set_completed.connect(_on_wifi_radio_set_completed)
 ```
+
+### Wi-Fi radio (enable / disable)
+
+Use these when you need to turn the system Wi-Fi radio on or off (equivalent to `nmcli radio wifi` on Linux or the OS Wi-Fi toggle on Windows).
+
+**Prefer the async API during gameplay** — radio changes can take several seconds while NetworkManager or polkit responds.
+
+```gdscript
+# Check whether the user can toggle before showing a switch
+var radio := WiFi.get_wifi_radio_state()
+$WifiToggle.disabled = not radio.can_toggle
+$WifiToggle.button_pressed = radio.enabled
+
+# Async toggle (recommended)
+func _on_wifi_toggle_pressed(enabled: bool) -> void:
+    WiFi.set_wifi_enabled_async(enabled)
+
+func _on_wifi_radio_set_completed(error: int, message: String) -> void:
+    if error != OK:
+        push_error("Wi-Fi radio: %s" % message)
+    $WifiToggle.button_pressed = WiFi.is_wifi_enabled()
+```
+
+`is_wifi_enabled()` returns the **effective** radio state (on Linux: software toggle **and** hardware not rfkill-blocked). After a successful toggle, `wifi_enabled_changed` is emitted when polling detects the new state.
 
 ### Methods
 
 | Function | Inputs | Output | Description |
 |----------|--------|--------|-------------|
-| `is_wifi_enabled()` | — | `bool` | Returns whether the Wi-Fi radio appears enabled. |
-| `set_wifi_enabled` | `enabled: bool` | `bool` | Enables or disables the Wi-Fi radio. May require elevated privileges. |
+| `is_wifi_enabled()` | — | `bool` | Returns whether the Wi-Fi radio is effectively on (software enabled and not hardware-blocked on Linux). |
+| `set_wifi_enabled` | `enabled: bool` | `bool` | **Sync.** Enables or disables the Wi-Fi radio. Blocks until the OS request finishes. May require elevation or polkit on Linux. Prefer `set_wifi_enabled_async` on the main thread. |
+| `set_wifi_enabled_async` | `enabled: bool` | `void` | **Async.** Starts a radio enable/disable on a worker thread; result arrives via `wifi_radio_set_completed`. Only one radio change runs at a time (`ERR_BUSY` if already in progress). |
+| `get_wifi_radio_state` | — | `Dictionary` | Returns a `WifiRadioState` snapshot (see [Data types](#data-types)). Use before showing a toggle to check `can_toggle` and `permission`. |
 | `scan_wifi_networks` | `adapter_id: String = ""` | `Array` | **Sync.** Scans for nearby networks. Blocks until complete — avoid on the main thread during gameplay. |
 | `scan_wifi_networks_async` | `adapter_id: String = ""` | `void` | **Async.** Starts a scan; results arrive via `scan_completed`. |
 | `connect_to_wifi` | `ssid: String`, `password: String = ""`, `adapter_id: String = ""` | `Error` | **Sync.** Connects to a network (open or WPA2-PSK). Blocks until the request finishes. |
@@ -51,7 +78,8 @@ Empty `adapter_id` uses the default / first Wi-Fi adapter on the platform.
 | `adapters_updated` | `adapters: Array`, `error: int`, `message: String` | Emitted when an async adapter refresh finishes. `adapters` is an array of `NetworkAdapter` dictionaries. |
 | `connectivity_changed` | `info: Dictionary` | Emitted when connectivity state changes (polled ~every 2s on the autoload). |
 | `connection_state_changed` | `state: int`, `ssid: String` | Emitted when connection state or active SSID changes. |
-| `wifi_enabled_changed` | `enabled: bool` | Emitted when the Wi-Fi radio enabled state changes. |
+| `wifi_enabled_changed` | `enabled: bool` | Emitted when the effective Wi-Fi radio state changes (polled ~every 2s, and after a successful async toggle). |
+| `wifi_radio_set_completed` | `error: int`, `message: String` | Emitted when `set_wifi_enabled_async` finishes. Check `error == OK` before updating UI; read `message` on failure. |
 
 `error` is a Godot `Error` code (`OK`, `ERR_CANT_CONNECT`, `ERR_BUSY`, etc.). `message` is friendly text for UI logs.
 
@@ -73,7 +101,9 @@ Platform backend status for each method. **Working** means the OS action reliabl
 | Function | Windows | Linux | macOS |
 |----------|---------|-------|-------|
 | `is_wifi_enabled` | **Working** | **Working** | Not implemented |
-| `set_wifi_enabled` | Partial | Partial | Not implemented |
+| `set_wifi_enabled` | Partial | **Working** | Not implemented |
+| `set_wifi_enabled_async` | Partial | **Working** | Not implemented |
+| `get_wifi_radio_state` | **Working** | **Working** | Not implemented |
 | `scan_wifi_networks` | **Working** | **Working** | Not implemented |
 | `scan_wifi_networks_async` | **Working** | **Working** | Not implemented |
 | `connect_to_wifi` | **Working** | **Working** | Not implemented |
@@ -87,7 +117,7 @@ Platform backend status for each method. **Working** means the OS action reliabl
 
 **Windows notes:** Uses the Native Wi-Fi API (`wlanapi`). Scan waits for `wlan_notification_acm_scan_complete`; connect waits for `wlan_notification_acm_connection_complete`. Requires [Location permission](#permissions) for active scans. `set_wifi_enabled` may require running as administrator.
 
-**Linux notes:** Requires NetworkManager (libnm). Connect, disconnect, and radio toggle may prompt [polkit authorization](#permissions). Open and WPA2-PSK networks supported. IWD-only or ConnMan setups are not supported.
+**Linux notes:** Requires NetworkManager (libnm). Connect, disconnect, and radio toggle are gated by [polkit](#permissions). Radio toggle uses NetworkManager `WirelessEnabled` via libnm. Open and WPA2-PSK networks supported. IWD-only or ConnMan setups are not supported. Use `get_wifi_radio_state()` to inspect `permission` (`yes`, `auth`, `no`) before offering a radio switch in UI.
 
 **macOS notes:** Backend in `src/platform/macos/` is a stub.
 
@@ -112,9 +142,11 @@ Microsoft documents this behavior in [Changes to API behavior for Wi-Fi access a
 
 | Capability | Requirement |
 |------------|-------------|
-| **Scan, connect, disconnect** | **NetworkManager** must be running. The user session needs permission to control networking — typically via **polkit**. Connect/disconnect or radio changes may show an authorization dialog (or fail with “Permission denied” in headless/CI unless policy allows it). |
+| **Scan, connect, disconnect** | **NetworkManager** must be running. The user session needs permission to control networking — typically via **polkit**. Connect/disconnect may show an authorization dialog when policy requires it. |
+| **Toggle Wi-Fi radio** | Requires polkit action `org.freedesktop.NetworkManager.enable-disable-wifi` (or equivalent distro policy). Call `get_wifi_radio_state()` first: `permission` is `yes` (allowed), `auth` (may need approval), or `no` (denied). `can_toggle` is `true` when permission is `yes` or `auth`. |
+| **No polkit popup in Godot** | Polkit prompts need a running **polkit authentication agent** (desktop environments usually start one). **Godot does not show polkit dialogs.** If `permission` is `auth` but no agent is present, `set_wifi_enabled` / `set_wifi_enabled_async` fail with a permission-denied style message and the radio does not change — even though the same user might succeed from a desktop tray or `pkexec`. Run Godot from a full desktop session, configure passwordless polkit rules for your user, or test radio toggle with `sudo` / elevated privileges. |
 | **Equivalent to Windows Location** | There is no separate “location” toggle for Wi-Fi scan on Linux. Access is governed by NetworkManager + polkit (e.g. `org.freedesktop.NetworkManager.wifi.share.open`, `org.freedesktop.NetworkManager.network-control`). Ensure your user can modify connections (`nmcli` works without sudo on your machine). |
-| **Headless / CI** | Run tests as a user with passwordless polkit rules for NetworkManager, or expect connect tests to be **pending** when authorization is denied. |
+| **Headless / CI** | Run tests as a user with passwordless polkit rules for NetworkManager, use `sudo` for live radio tests, or expect radio/connect tests to **pending** / fail when authorization is denied. |
 
 ### macOS
 
@@ -169,6 +201,18 @@ No editor plugin — registration is via `WifiGD.gdextension`.
 | `local_ip` | `String` | Assigned IP (IPv4 preferred, IPv6 fallback on Windows) |
 | `gateway` | `String` | Default gateway |
 | `dns_primary` | `String` | Primary DNS |
+
+#### Wi-Fi radio (`WifiRadioState`)
+
+Returned by `get_wifi_radio_state()`. On Linux, maps to NetworkManager client properties and polkit permission `enable-disable-wifi`.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `enabled` | `bool` | Effective radio on — matches `is_wifi_enabled()` (Linux: software on **and** hardware not rfkill-blocked) |
+| `software_enabled` | `bool` | OS/software Wi-Fi toggle (NetworkManager `WirelessEnabled` on Linux) |
+| `hardware_enabled` | `bool` | Hardware rfkill / airplane-style block (Linux: `WirelessHardwareEnabled`) |
+| `can_toggle` | `bool` | Whether `set_wifi_enabled` / `set_wifi_enabled_async` may be attempted (`true` when `permission` is `yes` or `auth`) |
+| `permission` | `String` | Linux polkit hint: `yes`, `auth`, `no`, or `unknown`. Windows/macOS may return `unknown` until fully mapped. |
 
 
 ---
