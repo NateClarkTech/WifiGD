@@ -30,8 +30,15 @@ constexpr DWORD kScanPollAttempts = 20;
 constexpr DWORD kScanNotificationTimeoutMs = 5000;
 constexpr DWORD kConnectNotificationTimeoutMs = 30000;
 constexpr DWORD kConnectPollFallbackMs = 5000;
+constexpr DWORD kRadioSetTimeoutMs = 30000;
+constexpr DWORD kRadioPollIntervalMs = 200;
 constexpr DWORD kWlanApiVersion = 2;
 constexpr DWORD kAvailableNetworkFlags = WLAN_AVAILABLE_NETWORK_INCLUDE_ALL_MANUAL_HIDDEN_PROFILES;
+
+struct InterfaceRadioState {
+	bool software_enabled = false;
+	bool hardware_enabled = false;
+};
 
 godot::String wide_to_utf8(const wchar_t *wide_string) {
 	if (wide_string == nullptr) {
@@ -163,6 +170,161 @@ godot::String friendly_win_error(const godot::String &operation, DWORD code) {
 godot::String report_win_failure(const godot::String &operation, DWORD code, DWORD wlan_reason_code = 0) {
 	log_windows_error_to_console(operation, code, wlan_reason_code);
 	return friendly_win_error(operation, code);
+}
+
+bool phy_radio_is_on(DOT11_RADIO_STATE state) {
+	return state == dot11_radio_state_on;
+}
+
+bool is_process_elevated() {
+	HANDLE token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+		return false;
+	}
+
+	TOKEN_ELEVATION elevation{};
+	DWORD size = 0;
+	const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+	CloseHandle(token);
+	return ok != FALSE && elevation.TokenIsElevated != 0;
+}
+
+godot::String wifi_radio_permission_hint() {
+	return is_process_elevated() ? "yes" : "no";
+}
+
+bool read_interface_radio_state(
+		HANDLE wlan_handle,
+		const GUID &iface_guid,
+		InterfaceRadioState &state,
+		godot::String &error_message) {
+	WLAN_RADIO_STATE *radio_state = nullptr;
+	DWORD data_size = 0;
+	const DWORD result = WlanQueryInterface(
+			wlan_handle,
+			&iface_guid,
+			wlan_intf_opcode_radio_state,
+			nullptr,
+			&data_size,
+			reinterpret_cast<PVOID *>(&radio_state),
+			nullptr);
+	if (result != ERROR_SUCCESS || radio_state == nullptr) {
+		error_message = report_win_failure("WlanQueryInterface radio_state", result);
+		return false;
+	}
+
+	state = InterfaceRadioState{};
+	for (DWORD i = 0; i < radio_state->dwNumberOfPhys; i++) {
+		if (phy_radio_is_on(radio_state->PhyRadioState[i].dot11SoftwareRadioState)) {
+			state.software_enabled = true;
+		}
+		if (phy_radio_is_on(radio_state->PhyRadioState[i].dot11HardwareRadioState)) {
+			state.hardware_enabled = true;
+		}
+	}
+
+	WlanFreeMemory(radio_state);
+	return true;
+}
+
+WifiRadioState aggregate_radio_state(const std::vector<InterfaceRadioState> &interface_states) {
+	WifiRadioState state;
+	for (const InterfaceRadioState &iface_state : interface_states) {
+		if (iface_state.software_enabled) {
+			state.software_enabled = true;
+		}
+		if (iface_state.hardware_enabled) {
+			state.hardware_enabled = true;
+		}
+	}
+
+	state.enabled = state.software_enabled && state.hardware_enabled;
+	state.permission = wifi_radio_permission_hint();
+	state.can_toggle = state.hardware_enabled;
+	return state;
+}
+
+bool radio_reached_requested_state(const WifiRadioState &state, bool enabled) {
+	if (enabled) {
+		return state.enabled;
+	}
+	return !state.software_enabled;
+}
+
+godot::String describe_radio_set_failure(const WifiRadioState &state, bool enabled) {
+	if (!is_process_elevated()) {
+		return "Wi-Fi radio did not change. Administrator privileges are required on Windows.";
+	}
+	if (enabled && !state.hardware_enabled) {
+		return "Wi-Fi is blocked by hardware (check physical switch or airplane mode).";
+	}
+	return enabled
+			? "Wi-Fi radio did not turn on in time. Check hardware switch or try again."
+			: "Wi-Fi radio did not turn off in time.";
+}
+
+bool collect_wifi_radio_state(HANDLE wlan_handle, WifiRadioState &state, godot::String &error_message) {
+	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
+	const DWORD result = WlanEnumInterfaces(wlan_handle, nullptr, &interfaces);
+	if (result != ERROR_SUCCESS) {
+		error_message = report_win_failure("WlanEnumInterfaces", result);
+		return false;
+	}
+	if (interfaces == nullptr || interfaces->dwNumberOfItems == 0) {
+		if (interfaces != nullptr) {
+			WlanFreeMemory(interfaces);
+		}
+		error_message = "No Wi-Fi interfaces available.";
+		return false;
+	}
+
+	std::vector<InterfaceRadioState> interface_states;
+	interface_states.reserve(interfaces->dwNumberOfItems);
+	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
+		InterfaceRadioState iface_state;
+		godot::String iface_error;
+		if (!read_interface_radio_state(
+					wlan_handle,
+					interfaces->InterfaceInfo[i].InterfaceGuid,
+					iface_state,
+					iface_error)) {
+			WlanFreeMemory(interfaces);
+			error_message = iface_error;
+			return false;
+		}
+		interface_states.push_back(iface_state);
+	}
+
+	WlanFreeMemory(interfaces);
+	state = aggregate_radio_state(interface_states);
+	return true;
+}
+
+bool wait_for_wifi_radio_state(HANDLE wlan_handle, bool enabled, DWORD timeout_ms) {
+	const DWORD start_tick = GetTickCount();
+	while (true) {
+		WifiRadioState state;
+		godot::String error_message;
+		if (!collect_wifi_radio_state(wlan_handle, state, error_message)) {
+			return false;
+		}
+		if (radio_reached_requested_state(state, enabled)) {
+			return true;
+		}
+
+		const DWORD elapsed = GetTickCount() - start_tick;
+		if (elapsed >= timeout_ms) {
+			break;
+		}
+		Sleep(kRadioPollIntervalMs);
+	}
+
+	WifiRadioState state;
+	godot::String error_message;
+	if (!collect_wifi_radio_state(wlan_handle, state, error_message)) {
+		return false;
+	}
+	return radio_reached_requested_state(state, enabled);
 }
 
 godot::String format_scan_error(DWORD code) {
@@ -615,35 +777,6 @@ bool resolve_interface_guid(
 	return true;
 }
 
-bool query_radio_enabled(HANDLE wlan_handle, const GUID &iface_guid, bool &enabled, godot::String &error_message) {
-	WLAN_RADIO_STATE *radio_state = nullptr;
-	DWORD data_size = 0;
-	DWORD result = WlanQueryInterface(
-			wlan_handle,
-			&iface_guid,
-			wlan_intf_opcode_radio_state,
-			nullptr,
-			&data_size,
-			reinterpret_cast<PVOID *>(&radio_state),
-			nullptr);
-	if (result != ERROR_SUCCESS || radio_state == nullptr) {
-		error_message = report_win_failure("WlanQueryInterface radio_state", result);
-		return false;
-	}
-
-	enabled = false;
-	for (DWORD i = 0; i < radio_state->dwNumberOfPhys; i++) {
-		if (radio_state->PhyRadioState[i].dot11SoftwareRadioState == dot11_radio_state_on ||
-				radio_state->PhyRadioState[i].dot11HardwareRadioState == dot11_radio_state_on) {
-			enabled = true;
-			break;
-		}
-	}
-
-	WlanFreeMemory(radio_state);
-	return true;
-}
-
 bool set_interface_radio(HANDLE wlan_handle, const GUID &iface_guid, bool enabled, godot::String &error_message) {
 	WLAN_RADIO_STATE *radio_state = nullptr;
 	DWORD data_size = 0;
@@ -977,34 +1110,15 @@ bool NetworkBackendWindows::is_wifi_enabled() {
 		return false;
 	}
 
-	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
-	const DWORD result = WlanEnumInterfaces(static_cast<HANDLE>(wlan_handle), nullptr, &interfaces);
-	if (result != ERROR_SUCCESS) {
-		set_error(report_win_failure("WlanEnumInterfaces", result));
-		return false;
-	}
-	if (interfaces == nullptr || interfaces->dwNumberOfItems == 0) {
-		if (interfaces != nullptr) {
-			WlanFreeMemory(interfaces);
-		}
-		last_error = "";
+	WifiRadioState state;
+	godot::String error_message;
+	if (!collect_wifi_radio_state(static_cast<HANDLE>(wlan_handle), state, error_message)) {
+		set_error(error_message);
 		return false;
 	}
 
-	bool any_enabled = false;
-	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
-		const GUID &iface_guid = interfaces->InterfaceInfo[i].InterfaceGuid;
-		bool radio_enabled = false;
-		godot::String error_message;
-		if (query_radio_enabled(static_cast<HANDLE>(wlan_handle), iface_guid, radio_enabled, error_message) && radio_enabled) {
-			any_enabled = true;
-			break;
-		}
-	}
-
-	WlanFreeMemory(interfaces);
 	last_error = "";
-	return any_enabled;
+	return state.enabled;
 }
 
 bool NetworkBackendWindows::set_wifi_enabled(bool enabled) {
@@ -1012,8 +1126,26 @@ bool NetworkBackendWindows::set_wifi_enabled(bool enabled) {
 		return false;
 	}
 
+	HANDLE handle = static_cast<HANDLE>(wlan_handle);
+	WifiRadioState current_state;
+	godot::String error_message;
+	if (!collect_wifi_radio_state(handle, current_state, error_message)) {
+		set_error(error_message);
+		return false;
+	}
+
+	if (enabled && !current_state.hardware_enabled) {
+		set_error("Wi-Fi is blocked by hardware (check physical switch or airplane mode).");
+		return false;
+	}
+
+	if (radio_reached_requested_state(current_state, enabled)) {
+		last_error = "";
+		return true;
+	}
+
 	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
-	DWORD result = WlanEnumInterfaces(static_cast<HANDLE>(wlan_handle), nullptr, &interfaces);
+	DWORD result = WlanEnumInterfaces(handle, nullptr, &interfaces);
 	if (result != ERROR_SUCCESS || interfaces == nullptr || interfaces->dwNumberOfItems == 0) {
 		if (interfaces != nullptr) {
 			WlanFreeMemory(interfaces);
@@ -1024,19 +1156,35 @@ bool NetworkBackendWindows::set_wifi_enabled(bool enabled) {
 
 	bool success = false;
 	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
-		godot::String error_message;
-		if (set_interface_radio(static_cast<HANDLE>(wlan_handle), interfaces->InterfaceInfo[i].InterfaceGuid, enabled, error_message)) {
+		godot::String iface_error;
+		if (set_interface_radio(handle, interfaces->InterfaceInfo[i].InterfaceGuid, enabled, iface_error)) {
 			success = true;
 		} else if (!success) {
-			set_error(error_message);
+			set_error(iface_error);
 		}
 	}
 
 	WlanFreeMemory(interfaces);
-	if (success) {
-		last_error = "";
+	if (!success) {
+		return false;
 	}
-	return success;
+
+	if (wait_for_wifi_radio_state(handle, enabled, kRadioSetTimeoutMs)) {
+		last_error = "";
+		return true;
+	}
+
+	if (!collect_wifi_radio_state(handle, current_state, error_message)) {
+		set_error(error_message);
+		return false;
+	}
+	if (radio_reached_requested_state(current_state, enabled)) {
+		last_error = "";
+		return true;
+	}
+
+	set_error(describe_radio_set_failure(current_state, enabled));
+	return false;
 }
 
 WifiRadioState NetworkBackendWindows::get_wifi_radio_state() {
@@ -1045,30 +1193,12 @@ WifiRadioState NetworkBackendWindows::get_wifi_radio_state() {
 		return state;
 	}
 
-	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
-	const DWORD result = WlanEnumInterfaces(static_cast<HANDLE>(wlan_handle), nullptr, &interfaces);
-	if (result != ERROR_SUCCESS || interfaces == nullptr || interfaces->dwNumberOfItems == 0) {
-		if (interfaces != nullptr) {
-			WlanFreeMemory(interfaces);
-		}
-		return state;
+	godot::String error_message;
+	if (!collect_wifi_radio_state(static_cast<HANDLE>(wlan_handle), state, error_message)) {
+		set_error(error_message);
+		return WifiRadioState();
 	}
 
-	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
-		const GUID &iface_guid = interfaces->InterfaceInfo[i].InterfaceGuid;
-		bool radio_enabled = false;
-		godot::String error_message;
-		if (query_radio_enabled(static_cast<HANDLE>(wlan_handle), iface_guid, radio_enabled, error_message) && radio_enabled) {
-			state.enabled = true;
-			state.software_enabled = true;
-			state.hardware_enabled = true;
-			break;
-		}
-	}
-
-	WlanFreeMemory(interfaces);
-	state.permission = "unknown";
-	state.can_toggle = true;
 	last_error = "";
 	return state;
 }
