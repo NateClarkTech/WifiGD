@@ -42,7 +42,9 @@ func _on_wifi_radio_set_completed(error: int, message: String) -> void:
     $WifiToggle.button_pressed = WiFi.is_wifi_enabled()
 ```
 
-`is_wifi_enabled()` returns the **effective** radio state (on Linux: software toggle **and** hardware not rfkill-blocked). After a successful toggle, `wifi_enabled_changed` is emitted when polling detects the new state.
+`is_wifi_enabled()` returns the **effective** radio state (on Linux: software toggle **and** hardware not rfkill-blocked). After a successful toggle, `wifi_radio_set_completed` reports `OK` and `wifi_enabled_changed` fires when polling detects the new state.
+
+On Linux, WifiGD **always attempts** the NetworkManager toggle (like the original implementation) and treats success by reading the actual radio state afterward — polkit `permission` is informational only and does not block the attempt. This allows unprivileged session users to toggle when NM allows it, without requiring `sudo`.
 
 ### Methods
 
@@ -211,7 +213,7 @@ Returned by `get_wifi_radio_state()`. On Linux, maps to NetworkManager client pr
 | `enabled` | `bool` | Effective radio on — matches `is_wifi_enabled()` (Linux: software on **and** hardware not rfkill-blocked) |
 | `software_enabled` | `bool` | OS/software Wi-Fi toggle (NetworkManager `WirelessEnabled` on Linux) |
 | `hardware_enabled` | `bool` | Hardware rfkill / airplane-style block (Linux: `WirelessHardwareEnabled`) |
-| `can_toggle` | `bool` | Whether `set_wifi_enabled` / `set_wifi_enabled_async` may be attempted (`true` when `permission` is `yes` or `auth`) |
+| `can_toggle` | `bool` | UI hint: `true` when hardware is not rfkill-blocked. Toggle is still attempted regardless of `permission`; success is determined by the OS state after the request. |
 | `permission` | `String` | Linux polkit hint: `yes`, `auth`, `no`, or `unknown`. Windows/macOS may return `unknown` until fully mapped. |
 
 

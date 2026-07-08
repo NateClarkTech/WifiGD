@@ -194,8 +194,9 @@ WifiRadioState read_wifi_radio_state(NMClient *client) {
 	const NMClientPermissionResult permission =
 			nm_client_get_permission_result(client, NM_CLIENT_PERMISSION_ENABLE_DISABLE_WIFI);
 	state.permission = permission_result_to_string(permission);
-	state.can_toggle = permission == NM_CLIENT_PERMISSION_RESULT_YES ||
-			permission == NM_CLIENT_PERMISSION_RESULT_AUTH;
+	// Hint for UI: not hard-blocked by rfkill. set_wifi_enabled still attempts the toggle
+	// even when permission is no/auth; success is determined by the resulting state.
+	state.can_toggle = state.hardware_enabled;
 	return state;
 }
 
@@ -207,6 +208,24 @@ bool radio_reached_requested_state(NMClient *client, bool enabled) {
 		return get_effective_wifi_enabled(client);
 	}
 	return nm_client_wireless_get_enabled(client) == FALSE;
+}
+
+godot::String describe_radio_set_failure(NMClient *client, bool enabled) {
+	if (client == nullptr) {
+		return "NetworkManager is not available.";
+	}
+
+	const NMClientPermissionResult permission =
+			nm_client_get_permission_result(client, NM_CLIENT_PERMISSION_ENABLE_DISABLE_WIFI);
+	if (permission == NM_CLIENT_PERMISSION_RESULT_NO) {
+		return "Permission denied by system policy for Wi-Fi radio control.";
+	}
+	if (permission == NM_CLIENT_PERMISSION_RESULT_AUTH) {
+		return "Wi-Fi radio did not change. Authorization may be required — Godot cannot show polkit dialogs.";
+	}
+	return enabled
+			? "Wi-Fi radio did not turn on in time. Check rfkill or try again."
+			: "Wi-Fi radio did not turn off in time.";
 }
 
 // libnm async D-Bus calls must run on a thread with an acquired GMainContext.
@@ -486,13 +505,10 @@ bool set_wifi_enabled_on(NMClient *client, GMainContext *context, bool enabled, 
 		return false;
 	}
 
-	const NMClientPermissionResult permission =
-			nm_client_get_permission_result(client, NM_CLIENT_PERMISSION_ENABLE_DISABLE_WIFI);
-	if (permission == NM_CLIENT_PERMISSION_RESULT_NO) {
-		error_out = "Permission denied by system policy for Wi-Fi radio control.";
-		return false;
-	}
-
+	// Do not gate on polkit permission before trying — NM may still apply the change for
+	// session users even when the cached permission is auth/no. Success is determined by
+	// the resulting radio state (same approach as the original implementation, but with
+	// a pumped GMainContext so reads and async signals are reliable).
 	if (radio_reached_requested_state(client, enabled)) {
 		error_out = "";
 		return true;
@@ -514,9 +530,7 @@ bool set_wifi_enabled_on(NMClient *client, GMainContext *context, bool enabled, 
 		return true;
 	}
 
-	error_out = enabled
-			? "Wi-Fi radio did not turn on in time. Approve the system dialog or check rfkill."
-			: "Wi-Fi radio did not turn off in time.";
+	error_out = describe_radio_set_failure(client, enabled);
 	return false;
 }
 

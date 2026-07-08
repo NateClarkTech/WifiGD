@@ -48,10 +48,10 @@
 		enabled           — Effective radio on (matches [method is_wifi_enabled])
 		software_enabled  — OS/software Wi-Fi toggle (NM WirelessEnabled on Linux)
 		hardware_enabled  — Hardware rfkill not blocking (NM WirelessHardwareEnabled on Linux)
-		can_toggle        — true when permission is yes or auth
-		permission        — Linux polkit hint: yes, auth, no, or unknown
+		can_toggle        — UI hint: true when hardware is not rfkill-blocked
+		permission        — Linux polkit hint: yes, auth, no, or unknown (informational)
 		[/codeblock]
-		[b]Wi-Fi radio:[/b] Prefer [method set_wifi_enabled_async] and [signal wifi_radio_set_completed] during gameplay. Call [method get_wifi_radio_state] before showing a toggle — disable the control when [code]can_toggle[/code] is [code]false[/code]. On Linux, polkit may require authorization; Godot does not display polkit dialogs, so failures with permission-denied messages are common without a desktop polkit agent or passwordless rules.
+		[b]Wi-Fi radio:[/b] Prefer [method set_wifi_enabled_async] and [signal wifi_radio_set_completed] during gameplay. On Linux, WifiGD always attempts the NetworkManager toggle and reports success when the radio state actually changes (no sudo required when NM allows it for the session user). [code]permission[/code] is a hint only — Godot cannot show polkit dialogs, so [code]auth[/code] may still fail without a desktop polkit agent.
 	</description>
 	<tutorials>
 	</tutorials>
