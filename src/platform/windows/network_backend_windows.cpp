@@ -1210,6 +1210,27 @@ std::vector<WifiNetwork> NetworkBackendWindows::scan_wifi_networks(const godot::
 	}
 
 	HANDLE handle = static_cast<HANDLE>(wlan_handle);
+
+	// Match Linux: do not attempt WlanScan while the software/hardware radio is off.
+	// Without this, Windows returns ERROR_INVALID_STATE / access errors and callers
+	// land on a failed network list instead of a "turn Wi-Fi on" path.
+	{
+		WifiRadioState radio;
+		godot::String radio_error;
+		if (!collect_wifi_radio_state(handle, radio, radio_error)) {
+			set_error(radio_error);
+			return networks;
+		}
+		if (!radio.enabled) {
+			if (!radio.hardware_enabled) {
+				set_error("Wi-Fi is blocked by hardware (check physical switch or airplane mode).");
+			} else {
+				set_error("Wi-Fi radio is disabled.");
+			}
+			return networks;
+		}
+	}
+
 	PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
 	DWORD result = WlanEnumInterfaces(handle, nullptr, &interfaces);
 	if (result != ERROR_SUCCESS) {
@@ -1445,16 +1466,23 @@ ConnectivityInfo NetworkBackendWindows::get_connectivity_info() {
 		return info;
 	}
 
+	// Prefer an interface that is associated or mid-handshake. Do NOT fall back to the
+	// first adapter when radio is on but idle — that left stale IPs / empty SSIDs and
+	// made GDScript treat "radio on, not joined" as "connected to your network".
 	const WLAN_INTERFACE_INFO *active_iface = nullptr;
 	for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
 		const WLAN_INTERFACE_STATE state = interfaces->InterfaceInfo[i].isState;
-		if (state == wlan_interface_state_connected || state == wlan_interface_state_associating) {
+		if (state == wlan_interface_state_connected
+				|| state == wlan_interface_state_associating
+				|| state == wlan_interface_state_discovering
+				|| state == wlan_interface_state_authenticating) {
 			active_iface = &interfaces->InterfaceInfo[i];
 			break;
 		}
 	}
 	if (active_iface == nullptr) {
-		active_iface = &interfaces->InterfaceInfo[0];
+		WlanFreeMemory(interfaces);
+		return info; // disconnected defaults
 	}
 
 	info.state = map_interface_state(active_iface->isState);
@@ -1477,13 +1505,19 @@ ConnectivityInfo NetworkBackendWindows::get_connectivity_info() {
 		WlanFreeMemory(attrs);
 	}
 
-	const godot::String iface_description = wide_to_utf8(active_iface->strInterfaceDescription);
-	if (const IpAdapterSnapshot *ip_adapter =
-				find_ip_adapter_for_wlan(ip_adapters, active_iface->InterfaceGuid, iface_description)) {
-		info.local_ip = ip_adapter->ip_address;
-		info.gateway = ip_adapter->gateway;
-		info.dns_primary = ip_adapter->dns_primary;
-		info.has_internet = !info.local_ip.is_empty() && !info.gateway.is_empty();
+	// Only report L3 addressing when actually associated (or actively connecting).
+	// Disconnected adapters often still have a cached/APIPA address on Windows.
+	if (info.is_wifi_connected
+			|| info.state == ConnectionState::CONNECTING
+			|| info.state == ConnectionState::CONNECTED) {
+		const godot::String iface_description = wide_to_utf8(active_iface->strInterfaceDescription);
+		if (const IpAdapterSnapshot *ip_adapter =
+					find_ip_adapter_for_wlan(ip_adapters, active_iface->InterfaceGuid, iface_description)) {
+			info.local_ip = ip_adapter->ip_address;
+			info.gateway = ip_adapter->gateway;
+			info.dns_primary = ip_adapter->dns_primary;
+			info.has_internet = info.is_wifi_connected && !info.local_ip.is_empty() && !info.gateway.is_empty();
+		}
 	}
 
 	WlanFreeMemory(interfaces);
